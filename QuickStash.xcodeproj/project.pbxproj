@@ -1,0 +1,525 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A1 /* QuickStashApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1 /* QuickStashApp.swift */; };
+		A2 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2 /* ContentView.swift */; };
+		A3 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = B3 /* Models.swift */; };
+		A4 /* StashViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B4 /* StashViewModel.swift */; };
+		A5 /* Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5 /* Components.swift */; };
+		A6 /* StashItemCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = B6 /* StashItemCard.swift */; };
+		A7 /* ClipboardMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7 /* ClipboardMonitor.swift */; };
+		A8 /* StorageManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8 /* StorageManager.swift */; };
+		A9 /* FileManager+QuickStash.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10 /* FileManager+QuickStash.swift */; };
+		A10 /* DraggableStatusButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = B11 /* DraggableStatusButton.swift */; };
+		A11 /* DropOverlayWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12 /* DropOverlayWindow.swift */; };
+		A12 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B13 /* SettingsView.swift */; };
+		A13 /* LaunchAtLoginManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14 /* LaunchAtLoginManager.swift */; };
+		A14 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B15 /* Assets.xcassets */; };
+		A15 /* DragDropSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B16 /* DragDropSupport.swift */; };
+		A16 /* ScreenshotModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B17 /* ScreenshotModels.swift */; };
+		A17 /* ScreenshotCaptureService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B18 /* ScreenshotCaptureService.swift */; };
+		A18 /* ScreenshotHotKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = B19 /* ScreenshotHotKey.swift */; };
+		A19 /* ScreenshotRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20 /* ScreenshotRenderer.swift */; };
+		A20 /* ScreenshotOverlayWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = B21 /* ScreenshotOverlayWindow.swift */; };
+		A21 /* ScreenshotCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B22 /* ScreenshotCoordinator.swift */; };
+		A22 /* DebugScreenshotStressHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = B23 /* DebugScreenshotStressHarness.swift */; };
+		TA1 /* QuickStashXCTest.swift in Sources */ = {isa = PBXBuildFile; fileRef = TB1 /* QuickStashXCTest.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		X1 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = P1 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = T1;
+			remoteInfo = QuickStash;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		B1 /* QuickStashApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickStashApp.swift; sourceTree = "<group>"; };
+		B2 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		B3 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		B4 /* StashViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StashViewModel.swift; sourceTree = "<group>"; };
+		B5 /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
+		B6 /* StashItemCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StashItemCard.swift; sourceTree = "<group>"; };
+		B7 /* ClipboardMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardMonitor.swift; sourceTree = "<group>"; };
+		B8 /* StorageManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StorageManager.swift; sourceTree = "<group>"; };
+		B9 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B10 /* FileManager+QuickStash.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "FileManager+QuickStash.swift"; sourceTree = "<group>"; };
+		B11 /* DraggableStatusButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DraggableStatusButton.swift; sourceTree = "<group>"; };
+		B12 /* DropOverlayWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DropOverlayWindow.swift; sourceTree = "<group>"; };
+		B13 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		B14 /* LaunchAtLoginManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchAtLoginManager.swift; sourceTree = "<group>"; };
+		B15 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B16 /* DragDropSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DragDropSupport.swift; sourceTree = "<group>"; };
+		B17 /* ScreenshotModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotModels.swift; sourceTree = "<group>"; };
+		B18 /* ScreenshotCaptureService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotCaptureService.swift; sourceTree = "<group>"; };
+		B19 /* ScreenshotHotKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotHotKey.swift; sourceTree = "<group>"; };
+		B20 /* ScreenshotRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotRenderer.swift; sourceTree = "<group>"; };
+		B21 /* ScreenshotOverlayWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotOverlayWindow.swift; sourceTree = "<group>"; };
+		B22 /* ScreenshotCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotCoordinator.swift; sourceTree = "<group>"; };
+		B23 /* DebugScreenshotStressHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugScreenshotStressHarness.swift; sourceTree = "<group>"; };
+		TB1 /* QuickStashXCTest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickStashXCTest.swift; sourceTree = "<group>"; };
+		C1 /* QuickStash.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = QuickStash.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		TC1 /* QuickStashTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = QuickStashTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		F1 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F2 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		G1 = {
+			isa = PBXGroup;
+			children = (
+				G2 /* QuickStash */,
+				G4 /* Tests */,
+				B15 /* Assets.xcassets */,
+				G3 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		G2 /* QuickStash */ = {
+			isa = PBXGroup;
+			children = (
+				B1 /* QuickStashApp.swift */,
+				B2 /* ContentView.swift */,
+				B3 /* Models.swift */,
+				B4 /* StashViewModel.swift */,
+				B5 /* Components.swift */,
+				B6 /* StashItemCard.swift */,
+				B7 /* ClipboardMonitor.swift */,
+				B8 /* StorageManager.swift */,
+				B10 /* FileManager+QuickStash.swift */,
+				B11 /* DraggableStatusButton.swift */,
+				B12 /* DropOverlayWindow.swift */,
+				B13 /* SettingsView.swift */,
+				B14 /* LaunchAtLoginManager.swift */,
+				B16 /* DragDropSupport.swift */,
+				B17 /* ScreenshotModels.swift */,
+				B18 /* ScreenshotCaptureService.swift */,
+				B19 /* ScreenshotHotKey.swift */,
+				B20 /* ScreenshotRenderer.swift */,
+				B21 /* ScreenshotOverlayWindow.swift */,
+				B22 /* ScreenshotCoordinator.swift */,
+				B23 /* DebugScreenshotStressHarness.swift */,
+				B9 /* Info.plist */,
+			);
+			path = QuickStash;
+			sourceTree = "<group>";
+		};
+		G3 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				C1 /* QuickStash.app */,
+				TC1 /* QuickStashTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		G4 /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				TB1 /* QuickStashXCTest.swift */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		T1 /* QuickStash */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = L1 /* Build configuration list for PBXNativeTarget "QuickStash" */;
+			buildPhases = (
+				S1 /* Sources */,
+				F1 /* Frameworks */,
+				R1 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = QuickStash;
+			productName = QuickStash;
+			productReference = C1 /* QuickStash.app */;
+			productType = "com.apple.product-type.application";
+		};
+		T2 /* QuickStashTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = TL1 /* Build configuration list for PBXNativeTarget "QuickStashTests" */;
+			buildPhases = (
+				TS1 /* Sources */,
+				F2 /* Frameworks */,
+				TR1 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				D1 /* PBXTargetDependency */,
+			);
+			name = QuickStashTests;
+			productName = QuickStashTests;
+			productReference = TC1 /* QuickStashTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		P1 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					T2 = {
+						CreatedOnToolsVersion = 26.3;
+						TestTargetID = T1;
+					};
+				};
+			};
+			buildConfigurationList = L2 /* Build configuration list for PBXProject "QuickStash" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = G1;
+			productRefGroup = G3 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				T1 /* QuickStash */,
+				T2 /* QuickStashTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		R1 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A14 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		TR1 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		S1 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1 /* QuickStashApp.swift in Sources */,
+				A2 /* ContentView.swift in Sources */,
+				A3 /* Models.swift in Sources */,
+				A4 /* StashViewModel.swift in Sources */,
+				A5 /* Components.swift in Sources */,
+				A6 /* StashItemCard.swift in Sources */,
+				A7 /* ClipboardMonitor.swift in Sources */,
+				A8 /* StorageManager.swift in Sources */,
+				A9 /* FileManager+QuickStash.swift in Sources */,
+				A10 /* DraggableStatusButton.swift in Sources */,
+				A11 /* DropOverlayWindow.swift in Sources */,
+				A12 /* SettingsView.swift in Sources */,
+				A13 /* LaunchAtLoginManager.swift in Sources */,
+				A15 /* DragDropSupport.swift in Sources */,
+				A16 /* ScreenshotModels.swift in Sources */,
+				A17 /* ScreenshotCaptureService.swift in Sources */,
+				A18 /* ScreenshotHotKey.swift in Sources */,
+				A19 /* ScreenshotRenderer.swift in Sources */,
+				A20 /* ScreenshotOverlayWindow.swift in Sources */,
+				A21 /* ScreenshotCoordinator.swift in Sources */,
+				A22 /* DebugScreenshotStressHarness.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		TS1 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				TA1 /* QuickStashXCTest.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		D1 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = T1 /* QuickStash */;
+			targetProxy = X1 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		C2 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 2;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				INFOPLIST_FILE = QuickStash/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.quickstash.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_TREAT_WARNINGS_AS_ERRORS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		C3 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 2;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				INFOPLIST_FILE = QuickStash/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.quickstash.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_TREAT_WARNINGS_AS_ERRORS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		C4 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		C5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+			};
+			name = Release;
+		};
+		TC2 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 2;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.quickstash.app.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_TREAT_WARNINGS_AS_ERRORS = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/QuickStash.app/Contents/MacOS/QuickStash";
+			};
+			name = Debug;
+		};
+		TC3 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 2;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.quickstash.app.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_TREAT_WARNINGS_AS_ERRORS = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/QuickStash.app/Contents/MacOS/QuickStash";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		L1 /* Build configuration list for PBXNativeTarget "QuickStash" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C2 /* Debug */,
+				C3 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		L2 /* Build configuration list for PBXProject "QuickStash" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C4 /* Debug */,
+				C5 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		TL1 /* Build configuration list for PBXNativeTarget "QuickStashTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				TC2 /* Debug */,
+				TC3 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = P1 /* Project object */;
+}

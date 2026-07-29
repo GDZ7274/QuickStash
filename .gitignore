@@ -1,0 +1,44 @@
+# macOS and editors
+.DS_Store
+.idea/
+.vscode/
+
+# Xcode user and build state
+**/xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+.build/
+*.xcarchive
+*.xcresult
+*.dSYM
+
+# Test, coverage, and logs
+*.profraw
+*.profdata
+*.log
+stress-*.json
+
+# Built and packaged products
+*.app
+*.zip
+
+# Local QuickStash application data
+items.json
+Files/
+Images/
+Importing/
+ImportManifests/
+DeletionManifests/
+Trash/
+
+# Local delivery evidence contains machine-specific paths and code identities
+DELIVERY_INFO.md
+
+# Credentials and signing material
+.env
+.env.*
+!.env.example
+*.p12
+*.cer
+*.mobileprovision
