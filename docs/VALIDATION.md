@@ -1,8 +1,20 @@
 # QuickStash 1.1.0 (2) 验证记录
 
-验证日期：2026-07-28
+初次验证日期：2026-07-28
+
+安装镜像复验日期：2026-08-03
 
 本文只保留可复现的验证结论，不记录本机用户名、临时目录、PID、临时代码身份或交付二进制哈希。
+
+## 2026-08-03 安装镜像复验
+
+- `verify_without_xcode.sh` 单独运行通过；另有 4 个完全隔离的并发实例同时通过，每个实例均包含 100 次截图组件循环。
+- Release `clean build` 通过，Swift strict concurrency 与 warnings-as-errors 保持开启。
+- Release 显式关闭代码覆盖率，最终可执行文件不包含 LLVM profile 符号，实际启动后未生成 `default.profraw`。
+- Hosted XCTest：33/33 通过，0 失败、0 跳过。
+- DMG 校验通过；挂载后的 App 为 `x86_64 + arm64` 通用二进制，版本为 `1.1.0 (2)`。
+- App 复制到隔离安装目录后签名验证和实际启动均通过，运行日志为空，未访问真实 QuickStash Application Support。
+- 交付 App 使用 Hardened Runtime 的 ad-hoc 本地签名，不含 `get-task-allow`；仍未完成 Developer ID 签名、公证或 staple。
 
 ## 自动化矩阵
 
