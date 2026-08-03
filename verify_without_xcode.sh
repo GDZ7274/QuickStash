@@ -22,6 +22,11 @@ for source_file in "$source_root"/*.swift; do
 done
 
 rg -F -q 'Assets.xcassets in Resources' "$project_root/QuickStash.xcodeproj/project.pbxproj"
+release_build_settings=$(sed -n '/C3 \/\* Release \*\//,/name = Release;/p' "$project_root/QuickStash.xcodeproj/project.pbxproj")
+if ! rg -F -q 'ENABLE_CODE_COVERAGE = NO;' <<< "$release_build_settings"; then
+  print -u2 "Release builds must disable code coverage instrumentation"
+  exit 1
+fi
 rg -F -q '.leftMouseDragged' "$source_root/QuickStashApp.swift"
 rg -F -q 'lazy var viewModel = StashViewModel.shared' "$source_root/QuickStashApp.swift"
 if rg -F -q 'NSPasteboard(name: .drag)' "$source_root/QuickStashApp.swift"; then
