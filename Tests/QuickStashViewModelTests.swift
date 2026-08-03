@@ -1598,8 +1598,11 @@ struct QuickStashViewModelTests {
                 URL(fileURLWithPath: $0.content).lastPathComponent == freshFileName
             })
         }
-        try await waitUntil(description: "expired orphan quarantine") {
+        try await waitUntil(description: "expired orphan retention cleanup") {
             !FileManager.default.fileExists(atPath: oldOrphan.content)
+                && !viewModel.items.contains(where: {
+                    URL(fileURLWithPath: $0.content).lastPathComponent == oldFileName
+                })
         }
         try expect(
             viewModel.items.first(where: {
