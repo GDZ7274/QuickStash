@@ -7,6 +7,7 @@ struct StashItemCard: View {
     let isSelectionMode: Bool
     let isSelected: Bool
     let onCopy: () -> Void
+    let onDelete: () -> Void
     let onToggleSelection: () -> Void
 
     @State private var isHovered = false
@@ -38,10 +39,10 @@ struct StashItemCard: View {
                     .cornerRadius(16)
                     .overlay(borderOverlay)
                     .overlay(
-                        // 拖拽层只覆盖卡片主体，不覆盖右上角复制按钮区域
+                        // Keep the drag source clear of the inline action buttons.
                         StashItemDragSource(item: item)
                             .cornerRadius(16)
-                            .padding(.trailing, 44) // 留出复制按钮的空间
+                            .padding(.trailing, 78)
                             .allowsHitTesting(true)
                     )
                     .contextMenu {
@@ -54,11 +55,13 @@ struct StashItemCard: View {
                         }
                     }
 
-                // 复制按钮单独浮在最上层，确保点击不被拦截
                 if !isSelectionMode {
-                    copyButton
-                        .padding(.top, 12)
-                        .padding(.trailing, 12)
+                    HStack(spacing: 6) {
+                        copyButton
+                        deleteButton
+                    }
+                    .padding(.top, 12)
+                    .padding(.trailing, 12)
                 }
             }
             .scaleEffect(isHovered ? 1.02 : 1.0)
@@ -89,12 +92,8 @@ struct StashItemCard: View {
 
             Spacer()
 
-            // 选择模式下在 topRow 保留占位（非选择模式 copyButton 已在 ZStack 顶层）
-            if isSelectionMode {
-                // 无按钮
-            } else {
-                // 占位，保持 topRow 右侧留白与 ZStack 复制按钮对齐
-                Color.clear.frame(width: 28, height: 28)
+            if !isSelectionMode {
+                Color.clear.frame(width: 62, height: 28)
             }
         }
     }
@@ -131,6 +130,23 @@ struct StashItemCard: View {
         }
         .buttonStyle(.plain)
         .opacity(isHovered ? 1 : 0.6)
+        .help(item.type.isLocalFile ? "打开" : "复制")
+        .accessibilityLabel(item.type.isLocalFile ? "打开" : "复制")
+    }
+
+    private var deleteButton: some View {
+        Button(role: .destructive, action: onDelete) {
+            Image(systemName: "trash")
+                .font(.system(size: 14))
+                .foregroundStyle(.red)
+                .frame(width: 28, height: 28)
+                .background(.quaternary.opacity(0.3))
+                .cornerRadius(8)
+        }
+        .buttonStyle(.plain)
+        .opacity(isHovered ? 1 : 0.6)
+        .help("删除")
+        .accessibilityLabel("删除")
     }
 
     @ViewBuilder

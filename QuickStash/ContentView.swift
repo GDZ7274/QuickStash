@@ -72,6 +72,7 @@ struct ContentView: View {
                                 isSelectionMode: isSelectionMode,
                                 isSelected: selectedItems.contains(item.id),
                                 onCopy: { viewModel.copyToClipboard(item) },
+                                onDelete: { viewModel.deleteItem(item) },
                                 onToggleSelection: { toggleSelection(item.id) }
                             )
                             .contextMenu {
@@ -104,6 +105,7 @@ struct ContentView: View {
                                             isSelectionMode: isSelectionMode,
                                             isSelected: selectedItems.contains(item.id),
                                             onCopy: { viewModel.copyToClipboard(item) },
+                                            onDelete: { viewModel.deleteItem(item) },
                                             onToggleSelection: { toggleSelection(item.id) }
                                         )
                                         .contextMenu {
