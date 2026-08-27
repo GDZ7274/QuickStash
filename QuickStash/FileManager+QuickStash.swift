@@ -1,6 +1,296 @@
 import Foundation
 import AppKit
 import Darwin
+import ImageIO
+import UniformTypeIdentifiers
+
+enum ClipboardPNGEncodingError: LocalizedError, Sendable {
+    case sourceTooLarge
+    case invalidImage
+    case sourceIncomplete
+    case dimensionsTooLarge
+    case encodingFailed
+    case outputTooLarge
+
+    var errorDescription: String? {
+        switch self {
+        case .sourceTooLarge:
+            return "剪贴板图片源数据过大，已跳过"
+        case .invalidImage:
+            return "无法解码剪贴板图片"
+        case .sourceIncomplete:
+            return "剪贴板图片尚未完整提供"
+        case .dimensionsTooLarge:
+            return "剪贴板图片像素尺寸过大，已跳过"
+        case .encodingFailed:
+            return "无法将剪贴板图片转换为 PNG"
+        case .outputTooLarge:
+            return "剪贴板图片转换为 PNG 后超过 50 MB，已跳过"
+        }
+    }
+}
+
+enum ClipboardPNGEncoder {
+    static let maximumSourceBytes = 256 * 1_024 * 1_024
+    static let maximumOutputBytes = 50 * 1_024 * 1_024
+    static let maximumPixelDimension: Int64 = 32_768
+    static let maximumDecodedBytes: Int64 = 256 * 1_024 * 1_024
+    static let maximumPixelCount = maximumDecodedBytes / 4
+    private static let pngSignature = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    private static let pngCRCTable: [UInt32] = (0..<256).map { index in
+        var value = UInt32(index)
+        for _ in 0..<8 {
+            value = (value & 1) == 1
+                ? 0xEDB8_8320 ^ (value >> 1)
+                : value >> 1
+        }
+        return value
+    }
+
+    static func isImageType(_ type: NSPasteboard.PasteboardType) -> Bool {
+        type == .png
+            || type == .tiff
+            || UTType(type.rawValue)?.conforms(to: .image) == true
+    }
+
+    static func pngData(from sourceData: Data, maximumOutputBytes: Int = maximumOutputBytes) throws -> Data {
+        try autoreleasepool {
+            try encodePNG(from: sourceData, maximumOutputBytes: maximumOutputBytes)
+        }
+    }
+
+    static func validateDimensions(width: Int64, height: Int64) throws {
+        guard width > 0,
+              height > 0,
+              width <= maximumPixelDimension,
+              height <= maximumPixelDimension else {
+            throw ClipboardPNGEncodingError.dimensionsTooLarge
+        }
+        let (pixelCount, overflow) = width.multipliedReportingOverflow(by: height)
+        guard !overflow, pixelCount <= maximumPixelCount else {
+            throw ClipboardPNGEncodingError.dimensionsTooLarge
+        }
+    }
+
+    private static func encodePNG(from sourceData: Data, maximumOutputBytes: Int) throws -> Data {
+        guard sourceData.count <= maximumSourceBytes else {
+            throw ClipboardPNGEncodingError.sourceTooLarge
+        }
+        let hasPNGSignature = sourceData.starts(with: pngSignature)
+        guard let source = CGImageSourceCreateWithData(sourceData as CFData, nil) else {
+            throw ClipboardPNGEncodingError.invalidImage
+        }
+        guard CGImageSourceGetCount(source) > 0 else {
+            switch CGImageSourceGetStatus(source) {
+            case .statusIncomplete, .statusReadingHeader, .statusUnexpectedEOF:
+                throw ClipboardPNGEncodingError.sourceIncomplete
+            default:
+                throw (hasPNGSignature || hasPlausibleIncompleteImageHeader(sourceData))
+                    ? ClipboardPNGEncodingError.sourceIncomplete
+                    : ClipboardPNGEncodingError.invalidImage
+            }
+        }
+        switch CGImageSourceGetStatusAtIndex(source, 0) {
+        case .statusComplete:
+            break
+        case .statusIncomplete, .statusReadingHeader, .statusUnexpectedEOF:
+            throw ClipboardPNGEncodingError.sourceIncomplete
+        default:
+            throw ClipboardPNGEncodingError.invalidImage
+        }
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.int64Value,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.int64Value else {
+            throw hasPNGSignature
+                ? ClipboardPNGEncodingError.sourceIncomplete
+                : ClipboardPNGEncodingError.invalidImage
+        }
+        try validateDimensions(width: width, height: height)
+        try validateEstimatedDecodedSize(
+            properties: properties,
+            width: width,
+            height: height
+        )
+
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        if hasPNGSignature, orientation == 1 {
+            guard isStructurallyValidPNG(sourceData) else {
+                throw ClipboardPNGEncodingError.invalidImage
+            }
+            guard let decodedImage = decodedImage(from: source) else {
+                throw ClipboardPNGEncodingError.sourceIncomplete
+            }
+            try validateDecodedSize(decodedImage)
+            guard sourceData.count <= maximumOutputBytes else {
+                throw ClipboardPNGEncodingError.outputTooLarge
+            }
+            return sourceData
+        }
+
+        let image: CGImage?
+        if orientation == 1 {
+            image = decodedImage(from: source)
+        } else {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: max(width, height),
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        }
+        guard let image else {
+            throw ClipboardPNGEncodingError.invalidImage
+        }
+        try validateDecodedSize(image)
+
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw ClipboardPNGEncodingError.encodingFailed
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw ClipboardPNGEncodingError.encodingFailed
+        }
+        let pngData = output as Data
+        guard pngData.starts(with: pngSignature) else {
+            throw ClipboardPNGEncodingError.encodingFailed
+        }
+        guard pngData.count <= maximumOutputBytes else {
+            throw ClipboardPNGEncodingError.outputTooLarge
+        }
+        return pngData
+    }
+
+    private static func decodedImage(from source: CGImageSource) -> CGImage? {
+        let options: [CFString: Any] = [
+            kCGImageSourceShouldCache: true,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        return CGImageSourceCreateImageAtIndex(source, 0, options as CFDictionary)
+    }
+
+    private static func isStructurallyValidPNG(_ data: Data) -> Bool {
+        guard data.starts(with: pngSignature), data.count >= 8 + 12 else { return false }
+        var offset = 8
+        var sawHeader = false
+        var sawImageData = false
+
+        while offset <= data.count - 12 {
+            let length = Int(readBigEndianUInt32(data, at: offset))
+            let typeOffset = offset + 4
+            let payloadOffset = typeOffset + 4
+            let (crcOffset, payloadOverflow) = payloadOffset.addingReportingOverflow(length)
+            let (nextOffset, chunkOverflow) = crcOffset.addingReportingOverflow(4)
+            guard !payloadOverflow,
+                  !chunkOverflow,
+                  crcOffset >= payloadOffset,
+                  nextOffset <= data.count else { return false }
+
+            let chunkType = readBigEndianUInt32(data, at: typeOffset)
+            let expectedCRC = readBigEndianUInt32(data, at: crcOffset)
+            guard pngCRC(data, from: typeOffset, to: crcOffset) == expectedCRC else { return false }
+
+            switch chunkType {
+            case 0x4948_4452: // IHDR
+                guard !sawHeader, offset == 8, length == 13 else { return false }
+                sawHeader = true
+            case 0x4944_4154: // IDAT
+                guard sawHeader else { return false }
+                sawImageData = true
+            case 0x4945_4E44: // IEND
+                return sawHeader && sawImageData && length == 0 && nextOffset == data.count
+            default:
+                guard sawHeader else { return false }
+            }
+            offset = nextOffset
+        }
+        return false
+    }
+
+    private static func readBigEndianUInt32(_ data: Data, at offset: Int) -> UInt32 {
+        let start = data.index(data.startIndex, offsetBy: offset)
+        let end = data.index(start, offsetBy: 4)
+        return data[start..<end].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+    }
+
+    private static func pngCRC(_ data: Data, from startOffset: Int, to endOffset: Int) -> UInt32 {
+        let start = data.index(data.startIndex, offsetBy: startOffset)
+        let end = data.index(data.startIndex, offsetBy: endOffset)
+        var crc = UInt32.max
+        for byte in data[start..<end] {
+            let tableIndex = Int((crc ^ UInt32(byte)) & 0xFF)
+            crc = pngCRCTable[tableIndex] ^ (crc >> 8)
+        }
+        return crc ^ UInt32.max
+    }
+
+    private static func hasPlausibleIncompleteImageHeader(_ data: Data) -> Bool {
+        if data.starts(with: [0xFF, 0xD8])
+            || data.starts(with: [0x49, 0x49, 0x2A, 0x00])
+            || data.starts(with: [0x4D, 0x4D, 0x00, 0x2A])
+            || data.starts(with: [0x47, 0x49, 0x46, 0x38])
+            || data.starts(with: [0x42, 0x4D]) {
+            return true
+        }
+        if data.count >= 12,
+           data.starts(with: [0x52, 0x49, 0x46, 0x46]),
+           data.dropFirst(8).prefix(4).elementsEqual([0x57, 0x45, 0x42, 0x50]) {
+            return true
+        }
+        guard data.count >= 12,
+              data.dropFirst(4).prefix(4).elementsEqual([0x66, 0x74, 0x79, 0x70]) else { return false }
+        let brand = String(decoding: data.dropFirst(8).prefix(4), as: UTF8.self)
+        return ["heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1", "avif", "avis"]
+            .contains(brand)
+    }
+
+    private static func validateEstimatedDecodedSize(
+        properties: [CFString: Any],
+        width: Int64,
+        height: Int64
+    ) throws {
+        let depth = max(8, (properties[kCGImagePropertyDepth] as? NSNumber)?.int64Value ?? 8)
+        let colorModel = properties[kCGImagePropertyColorModel] as? String
+        let colorChannels: Int64
+        switch colorModel {
+        case "Gray", "Monochrome":
+            colorChannels = 1
+        case "CMYK":
+            colorChannels = 4
+        default:
+            colorChannels = 3
+        }
+        let hasAlpha = (properties[kCGImagePropertyHasAlpha] as? NSNumber)?.boolValue == true
+        let channels = colorChannels + (hasAlpha ? 1 : 0)
+        let (bitsPerPixel, bitsOverflow) = depth.multipliedReportingOverflow(by: channels)
+        let (roundedBits, roundingOverflow) = bitsPerPixel.addingReportingOverflow(7)
+        guard !bitsOverflow, !roundingOverflow else {
+            throw ClipboardPNGEncodingError.dimensionsTooLarge
+        }
+        let bytesPerPixel = max(4, roundedBits / 8)
+        let (pixelCount, pixelOverflow) = width.multipliedReportingOverflow(by: height)
+        let (decodedBytes, byteOverflow) = pixelCount.multipliedReportingOverflow(by: bytesPerPixel)
+        guard !pixelOverflow,
+              !byteOverflow,
+              decodedBytes <= maximumDecodedBytes else {
+            throw ClipboardPNGEncodingError.dimensionsTooLarge
+        }
+    }
+
+    private static func validateDecodedSize(_ image: CGImage) throws {
+        let (decodedBytes, overflow) = Int64(image.bytesPerRow)
+            .multipliedReportingOverflow(by: Int64(image.height))
+        guard !overflow, decodedBytes <= maximumDecodedBytes else {
+            throw ClipboardPNGEncodingError.dimensionsTooLarge
+        }
+    }
+}
 
 struct ImportPolicy: Sendable, Equatable {
     let maximumSourceItems: Int
@@ -1704,12 +1994,12 @@ final class QuickStashFileManager: @unchecked Sendable {
             ioQueue.async { [self] in
                 do {
                     try ensureDirectories()
-                    let normalizedExtension = fileExtension.lowercased() == "tiff" ? "tiff" : "png"
+                    let pngData = try ClipboardPNGEncoder.pngData(from: data)
                     let fileURL = imagesDirectory
                         .appendingPathComponent(UUID().uuidString)
-                        .appendingPathExtension(normalizedExtension)
-                    try data.write(to: fileURL, options: .atomic)
-                    let size = ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)
+                        .appendingPathExtension("png")
+                    try pngData.write(to: fileURL, options: .atomic)
+                    let size = ByteCountFormatter.string(fromByteCount: Int64(pngData.count), countStyle: .file)
                     continuation.resume(returning: StashItem(
                         type: .image,
                         content: fileURL.path,
@@ -1747,12 +2037,12 @@ final class QuickStashFileManager: @unchecked Sendable {
                     }
                     let url = URL(fileURLWithPath: path)
                     let values = try url.resourceValues(forKeys: [.fileSizeKey])
-                    guard (values.fileSize ?? 0) <= 50 * 1024 * 1024 else {
+                    guard (values.fileSize ?? 0) <= ClipboardPNGEncoder.maximumSourceBytes else {
                         throw CocoaError(.fileReadTooLarge)
                     }
                     let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-                    let type: NSPasteboard.PasteboardType = url.pathExtension.lowercased() == "tiff" ? .tiff : .png
-                    continuation.resume(returning: ClipboardImagePayload(data: data, pasteboardType: type))
+                    let pngData = try ClipboardPNGEncoder.pngData(from: data)
+                    continuation.resume(returning: ClipboardImagePayload(data: pngData, pasteboardType: .png))
                 } catch {
                     continuation.resume(throwing: error)
                 }

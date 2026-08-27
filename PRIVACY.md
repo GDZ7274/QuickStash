@@ -1,6 +1,6 @@
 # QuickStash 隐私说明
 
-更新时间：2026-07-29
+更新时间：2026-08-27
 
 ## 原则
 
@@ -10,7 +10,9 @@ QuickStash 当前版本是本地优先的 macOS 工具。源码中没有网络�
 
 - 首次使用时必须在应用内明确选择“启用实时记录”。
 - 未授权或关闭记录后，QuickStash 不会读取新的系统剪贴板内容。
-- 启用后可记录普通文字、HTTP(S) 链接、PNG 和 TIFF。
+- 启用后可记录普通文字、HTTP(S) 链接，以及 PNG、TIFF、JPEG、HEIC/HEIF、WebP 等 macOS 可解码图片。
+- 新记录的外部图片只在本机使用 ImageIO 转换，统一以真实 PNG 保存；旧 TIFF 历史不会被后台批量改写，复制时才在内存中转换为 PNG。
+- 图片源、像素尺寸、估算解码内存和 PNG 输出均有上限；暂未完整提供的数据只做有限重试。
 - QuickStash 自身复制的截图会在系统剪贴板写入成功后记录为本地图片历史，并保证只提交一次。
 - concealed、transient 和自动生成的常见敏感 pasteboard 类型会被跳过。
 - 默认最多保留 100 条、最长 30 天；固定项目不会自动清理。
@@ -35,7 +37,7 @@ QuickStash 当前版本是本地优先的 macOS 工具。源码中没有网络�
 
 - `items.json`：版本化历史 metadata。
 - `Files`：QuickStash 管理的导入文件。
-- `Images`：外部剪贴板图片和 QuickStash 截图历史。
+- `Images`：统一为 PNG 的新剪贴板图片、兼容保留的旧图片历史和 QuickStash 截图历史。
 - `Importing`：尚未完成的导入暂存。
 - `ImportManifests`、`DeletionManifests`：恢复所需 manifest。
 - `Trash`：应用自有的七天回收目录。

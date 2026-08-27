@@ -202,6 +202,15 @@ struct QuickStashCoreTests {
         guard condition() else { throw TestFailure.assertion(message) }
     }
 
+    private static func validPNGFixture() throws -> Data {
+        guard let data = Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ) else {
+            throw TestFailure.assertion("Could not decode embedded PNG fixture")
+        }
+        return data
+    }
+
     private static func testTypeClassification() throws {
         try expect(ItemType.fromFileExtension("PDF") == .pdf, "PDF classification failed")
         try expect(ItemType.fromFileExtension("zip") == .archive, "Archive classification failed")
@@ -1054,7 +1063,10 @@ struct QuickStashCoreTests {
             withIntermediateDirectories: true
         )
         try Data("nested".utf8).write(to: orphanDirectory.appendingPathComponent("nested/file.txt"))
-        let imageOrphan = try await manager.saveClipboardImage(data: Data([9, 8, 7]), fileExtension: "png")
+        let imageOrphan = try await manager.saveClipboardImage(
+            data: try validPNGFixture(),
+            fileExtension: "png"
+        )
         let imageOrphanName = URL(fileURLWithPath: imageOrphan.content).lastPathComponent
         let missingPath = manager.storageDirectory.appendingPathComponent("missing-pinned.txt").path
         let missing = StashItem(

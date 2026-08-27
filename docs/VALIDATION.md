@@ -1,12 +1,34 @@
-# QuickStash 1.1.0 (2) 验证记录
+# QuickStash 1.1.0 (3) 验证记录
 
 初次验证日期：2026-07-28
 
 安装镜像复验日期：2026-08-03
 
+剪贴板图片可靠性复验日期：2026-08-27
+
+最终安装镜像复验日期：2026-08-27
+
 本文只保留可复现的验证结论，不记录本机用户名、临时目录、PID、临时代码身份或交付二进制哈希。
 
-## 2026-08-03 安装镜像复验
+## 2026-08-27 剪贴板图片可靠性复验
+
+- PNG、TIFF、JPEG、HEIC 和 WebP 单一/后备表示均可读取，并统一生成真实 PNG 历史文件。
+- 首选 PNG 暂不可用、数据不完整或输出超限时继续尝试后备图片表示；图片最终不可用时保留同一事件的文字/链接后备。
+- TIFF/JPEG 转换保持物理像素尺寸，EXIF 方向转正，TIFF Alpha 保留；旧 TIFF 历史复制时输出 PNG 且原文件不被改写。
+- 图片源、单边尺寸、总像素、位深/通道估算解码内存、实际 raster 和 PNG 输出均有上限；PNG 原样保留前校验 chunk、CRC 并立即解码像素。
+- 不可取消的同步 provider 最多并行两条；软超时、迟到同计数提交、新旧计数隔离、跨停用 generation、有界退出和保存取消均有确定性回归测试。
+- 纯文字和 URL 一次稳定读取即提交；Hosted 实时同步用例连续 10 次通过，明确声明的待就绪图片仍保留后备文字和有限重试。
+
+## 2026-08-27 最终安装镜像复验
+
+- Release Archive 和 DMG 均从最终源码重新构建，版本为 `1.1.0 (3)`。
+- DMG 通过 `hdiutil verify`，只读挂载后包含 `QuickStash.app` 和指向 `/Applications` 的安装链接。
+- 挂载镜像中的 App 主程序与 `QuickStashClipboardReader` helper 均为 `x86_64 + arm64` 通用二进制。
+- App 通过 `codesign --verify --deep --strict`；App 和 helper 均为 ad-hoc Hardened Runtime 签名，不含 `get-task-allow`。
+- Release 主程序、helper 和 App bundle 均不含 LLVM profile 符号、section 或 `.profraw` 文件。
+- 当前机器没有 Developer ID Application 身份，因此该镜像是本机测试版，未公证或 staple。
+
+## 2026-08-03 安装镜像复验（1.1.0 (2) 历史记录）
 
 - `verify_without_xcode.sh` 单独运行通过；另有 4 个完全隔离的并发实例同时通过，每个实例均包含 100 次截图组件循环。
 - Release `clean build` 通过，Swift strict concurrency 与 warnings-as-errors 保持开启。
@@ -26,7 +48,7 @@
 - `SWIFT_TREAT_WARNINGS_AS_ERRORS=YES`：通过。
 - Xcode Analyze：通过。
 - Hosted XCTest：33/33 通过，0 失败、0 跳过。
-- Thread Sanitizer Hosted XCTest：33/33 通过，未报告数据竞争。
+- Thread Sanitizer Hosted XCTest：排除依赖未插桩 helper 读取系统剪贴板的单个跨进程用例后 32/32 通过；剪贴板 ViewModel、helper 超时和 `changeCount` 状态机另以独立 TSan 可执行文件通过，均未报告数据竞争。
 - 真实 ScreenCaptureKit 压力：100/100 通过。
 
 ## 覆盖范围
@@ -42,8 +64,9 @@
 
 ### 剪贴板
 
-- 普通文字、显式 URL、纯文本 HTTP(S) 链接、PNG 和 TIFF。
+- 普通文字、显式 URL、纯文本 HTTP(S) 链接，以及 PNG、TIFF、JPEG、HEIC 和 WebP 图片。
 - provider 延迟物化、稳定 `changeCount`、重试和只记录一次。
+- 图片统一 PNG 落盘、格式后备、旧 TIFF 内存转 PNG、迟到 provider 和最多两条读取 lane。
 - 内部复制只抑制精确的自身 `changeCount`。
 - 外部图片保存不会被后续文字或链接复制取消。
 - QuickStash 截图 PNG 在系统写入成功后准确提交一次历史。

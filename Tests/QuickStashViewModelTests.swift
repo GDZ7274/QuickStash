@@ -1,6 +1,9 @@
 import Foundation
 import Combine
 import AppKit
+import ImageIO
+import UniformTypeIdentifiers
+import Darwin
 
 private enum ViewModelTestFailure: Error, CustomStringConvertible {
     case assertion(String)
@@ -131,20 +134,21 @@ private final class FakeClipboardPasteboard: ClipboardPasteboard, @unchecked Sen
         maximumImageBytes: Int,
         maximumTextCharacters: Int
     ) -> ClipboardPayloadSnapshot? {
-        let gate = lock.withLock { () -> DispatchSemaphore? in
+        let (gate, forcedSnapshot) = lock.withLock { () -> (DispatchSemaphore?, ClipboardPayloadSnapshot?) in
             storedPayloadReadCount += 1
             activeReaders += 1
             storedMaximumConcurrentReaders = max(storedMaximumConcurrentReaders, activeReaders)
             storedReadOccurredOnMainThread = storedReadOccurredOnMainThread || Thread.isMainThread
             defer { readGate = nil }
-            return readGate
+            let snapshot = storedForcedSnapshots.isEmpty ? nil : storedForcedSnapshots.removeFirst()
+            return (readGate, snapshot)
         }
         readStarted.signal()
         gate?.wait()
         return lock.withLock {
             defer { activeReaders -= 1 }
-            if !storedForcedSnapshots.isEmpty {
-                return storedForcedSnapshots.removeFirst()
+            if let forcedSnapshot {
+                return forcedSnapshot
             }
             let payload: ClipboardPayloadRead
             if storedEmptyReadsRemaining > 0 {
@@ -165,6 +169,28 @@ private final class FakeClipboardPasteboard: ClipboardPasteboard, @unchecked Sen
             }
             return ClipboardPayloadSnapshot(changeCount: storedChangeCount, payload: payload)
         }
+    }
+}
+
+private final class SlowPNGDataProvider: NSObject, NSPasteboardItemDataProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private let delay: TimeInterval
+    private var storedInvocationCount = 0
+
+    init(delay: TimeInterval = 0.6) {
+        self.delay = delay
+    }
+
+    var invocationCount: Int { lock.withLock { storedInvocationCount } }
+
+    func pasteboard(
+        _ pasteboard: NSPasteboard?,
+        item: NSPasteboardItem,
+        provideDataForType type: NSPasteboard.PasteboardType
+    ) {
+        guard type == .png else { return }
+        lock.withLock { storedInvocationCount += 1 }
+        Thread.sleep(forTimeInterval: delay)
     }
 }
 
@@ -197,6 +223,42 @@ private final class ImageDateRecorder: @unchecked Sendable {
     private var recorded: Date?
     func record(_ date: Date) { lock.withLock { recorded = date } }
     var value: Date? { lock.withLock { recorded } }
+}
+
+private final class FailOnceClipboardImageSaver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedCallCount = 0
+
+    var callCount: Int { lock.withLock { storedCallCount } }
+
+    func save(data: Data, observedAt: Date) async throws -> StashItem {
+        let attempt = lock.withLock { () -> Int in
+            storedCallCount += 1
+            return storedCallCount
+        }
+        if attempt == 1 {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        return StashItem(
+            type: .image,
+            content: "/tmp/retried-clipboard-image-\(data.count).png",
+            preview: "retried image",
+            createdAt: observedAt,
+            managedOrigin: .clipboard
+        )
+    }
+}
+
+private final class AlwaysFailClipboardImageSaver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedCallCount = 0
+
+    var callCount: Int { lock.withLock { storedCallCount } }
+
+    func save() async throws -> StashItem {
+        lock.withLock { storedCallCount += 1 }
+        throw CocoaError(.fileWriteUnknown)
+    }
 }
 
 @MainActor
@@ -312,6 +374,12 @@ private struct ImportManifestFixture: Codable {
 @main
 struct QuickStashViewModelTests {
     static func main() async throws {
+        if CommandLine.arguments.contains("--expected-change-count") {
+            _ = Darwin.signal(SIGTERM, SIG_IGN)
+            try? await Task.sleep(nanoseconds: 60_000_000_000)
+            return
+        }
+
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("QuickStashViewModelTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -328,6 +396,13 @@ struct QuickStashViewModelTests {
         try await testClipboardBaselineInternalWritesAndOrigins()
         try await testInternalWriteReceiptDoesNotSuppressExternalCopy()
         try await testClipboardTimerCapturesTextLinkAndImage()
+        try testSystemClipboardNormalizesImageFormatsAndFallback()
+        try await testClipboardHelperForceKillsBlockedProcessAtTimeout()
+        try await testClipboardHelperSelfWatchdogTerminatesBlockedProvider()
+        try await testSystemClipboardHelperTimesOutBlockedFlavorAndUsesFallback()
+        try testClipboardPNGEncoderBoundariesAndMetadata()
+        try await testPromisedImageFallsBackToText()
+        try await testPendingImageRetryReportsTerminalError()
         try await testClipboardRetriesEmptySnapshotWithoutChangeCountAdvance()
         try await testSameCountTextUpgradesToImage()
         try await testInFlightImageBeatsProvisionalText(in: root)
@@ -336,7 +411,14 @@ struct QuickStashViewModelTests {
         try await testPreparedClipboardImageTransaction()
         try await testClipboardImageSurvivesLaterText(in: root)
         try await testClipboardStopRejectsLateRead()
+        try await testClipboardAcceptsLateImageAfterSoftTimeout()
+        try await testTimedOutImageUpgradeSurvivesNewerCopy(in: root)
+        try await testLateReadCannotConsumeNewerCount()
+        try await testLateTextStillWaitsForSameCountImage()
         try await testClipboardReadTimeoutRecoversForLaterCopy()
+        try await testClipboardPayloadReadLaneCapAndBoundedDrain()
+        try await testClipboardImageSaveRetriesTransientFailure()
+        try await testClipboardImageSaveCancellationStopsRetry()
         try testSystemClipboardReadsExplicitURLType()
         try await testClipboardReaderIsSerialAndDoesNotBlockMainActor()
         try await testClipboardShutdownDrainsImageSave(in: root)
@@ -347,9 +429,179 @@ struct QuickStashViewModelTests {
         try await testClipboardRetentionTimer()
         try await testPinIsRejectedDuringClipboardCleanup(in: root)
         try await testClipboardImageOrphanRecoveryRetentionClearAndRestart(in: root)
+        try await testClipboardStorageAndLegacyRepublishUsePNG(in: root)
         try await testPartialClipboardClear(in: root)
 
         print("QuickStash view-model tests passed")
+    }
+
+    private static func testClipboardHelperForceKillsBlockedProcessAtTimeout() async throws {
+        let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        let client = ClipboardPasteboardHelperClient(
+            executableURL: executableURL,
+            readTimeout: 0.1
+        )
+        let startedAt = Date()
+        let result = await Task.detached {
+            client.read(
+                pasteboardName: NSPasteboard.Name.general.rawValue,
+                type: NSPasteboard.PasteboardType.png.rawValue,
+                expectedChangeCount: 0,
+                mode: .data,
+                maximumBytes: 1_024
+            )
+        }.value
+        guard case .timedOut = result else {
+            throw ViewModelTestFailure.assertion("Blocked clipboard helper was not terminated at timeout")
+        }
+        let elapsed = Date().timeIntervalSince(startedAt)
+        try expect(elapsed >= 0.15, "Blocked clipboard helper exited before the SIGKILL grace period")
+        try expect(
+            elapsed < 1,
+            "Blocked clipboard helper did not terminate promptly"
+        )
+    }
+
+    @MainActor
+    private static func testClipboardHelperSelfWatchdogTerminatesBlockedProvider() async throws {
+        guard let helperPath = ProcessInfo.processInfo.environment[
+            ClipboardPasteboardHelperClient.executablePathEnvironmentKey
+        ], FileManager.default.isExecutableFile(atPath: helperPath) else {
+            throw ViewModelTestFailure.assertion("Compiled clipboard helper is unavailable to watchdog test")
+        }
+
+        let pasteboard = NSPasteboard.withUniqueName()
+        let provider = SlowPNGDataProvider()
+        defer { pasteboard.releaseGlobally() }
+        let item = NSPasteboardItem()
+        item.setDataProvider(provider, forTypes: [.png])
+        pasteboard.clearContents()
+        try expect(pasteboard.writeObjects([item]), "Could not publish self-watchdog provider fixture")
+        let arguments = [
+            "--pasteboard-name", pasteboard.name.rawValue,
+            "--type", NSPasteboard.PasteboardType.png.rawValue,
+            "--expected-change-count", String(pasteboard.changeCount),
+            "--mode", ClipboardPasteboardHelperMode.data.rawValue,
+            "--maximum-bytes", "1024",
+            "--self-timeout-milliseconds", "300"
+        ]
+        let status = try await Task.detached { () throws -> Int32 in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: helperPath)
+            process.arguments = arguments
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        }.value
+        try expect(status == 14, "Clipboard helper self-watchdog did not return exit status 14")
+        try expect(provider.invocationCount > 0, "Self-watchdog provider fixture was not requested")
+    }
+
+    @MainActor
+    private static func makeBitmapImageData(
+        width: Int = 64,
+        height: Int = 48,
+        fileType: NSBitmapImageRep.FileType
+    ) throws -> Data {
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: width,
+            pixelsHigh: height,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ), let bytes = bitmap.bitmapData else {
+            throw ViewModelTestFailure.assertion("Could not create bitmap fixture")
+        }
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = y * bitmap.bytesPerRow + x * 4
+                bytes[offset] = UInt8((x * 3) % 255)
+                bytes[offset + 1] = UInt8((y * 5) % 255)
+                bytes[offset + 2] = 160
+                bytes[offset + 3] = UInt8(128 + ((x + y) % 127))
+            }
+        }
+        let properties: [NSBitmapImageRep.PropertyKey: Any] = fileType == .jpeg
+            ? [.compressionFactor: 0.95]
+            : [:]
+        guard let data = bitmap.representation(using: fileType, properties: properties) else {
+            throw ViewModelTestFailure.assertion("Could not encode bitmap fixture")
+        }
+        return data
+    }
+
+    @MainActor
+    private static func makeImageIOData(
+        width: Int,
+        height: Int,
+        type: UTType,
+        orientation: Int = 1
+    ) throws -> Data {
+        let jpegData = try makeBitmapImageData(width: width, height: height, fileType: .jpeg)
+        guard let source = CGImageSourceCreateWithData(jpegData as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw ViewModelTestFailure.assertion("Could not decode ImageIO source fixture")
+        }
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            type.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw ViewModelTestFailure.assertion("Could not create \(type.identifier) fixture destination")
+        }
+        let properties: [CFString: Any] = [
+            kCGImagePropertyOrientation: orientation,
+            kCGImageDestinationLossyCompressionQuality: 0.9
+        ]
+        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else {
+            throw ViewModelTestFailure.assertion("Could not encode \(type.identifier) fixture")
+        }
+        return output as Data
+    }
+
+    @MainActor
+    private static func makeAlphaTIFFData() throws -> Data {
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 4,
+            pixelsHigh: 1,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ), let bytes = bitmap.bitmapData else {
+            throw ViewModelTestFailure.assertion("Could not create alpha TIFF fixture")
+        }
+        let alphaValues: [UInt8] = [0, 64, 128, 255]
+        for (x, alpha) in alphaValues.enumerated() {
+            let offset = x * 4
+            bytes[offset] = 40
+            bytes[offset + 1] = 120
+            bytes[offset + 2] = 220
+            bytes[offset + 3] = alpha
+        }
+        guard let data = bitmap.representation(using: .tiff, properties: [:]) else {
+            throw ViewModelTestFailure.assertion("Could not encode alpha TIFF fixture")
+        }
+        return data
+    }
+
+    private static func isPNG(_ data: Data) -> Bool {
+        data.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
     }
 
     @MainActor
@@ -517,7 +769,7 @@ struct QuickStashViewModelTests {
             received[0].content == "抢在内部写入返回前的外部复制",
             "Internal write receipt suppressed a later external clipboard change"
         )
-        try expect(pasteboard.payloadReadCount == 5, "External clipboard text did not complete its stability window")
+        try expect(pasteboard.payloadReadCount == 1, "Stable external clipboard text was read more than once")
     }
 
     @MainActor
@@ -530,15 +782,18 @@ struct QuickStashViewModelTests {
 
         let pasteboard = FakeClipboardPasteboard()
         pasteboard.changeCount = 100
+        let pngFixture = try makeBitmapImageData(fileType: .png)
+        let tiffFixture = try makeBitmapImageData(fileType: .tiff)
         var received: [StashItem] = []
         let monitor = ClipboardMonitor(
             preferences: ClipboardPreferences(defaults: defaults),
             pasteboard: pasteboard,
             pollingInterval: 0.05,
-            imageSaver: { data, fileExtension, observedAt in
-                StashItem(
+            imageSaver: { data, _, observedAt in
+                let pngData = try ClipboardPNGEncoder.pngData(from: data)
+                return StashItem(
                     type: .image,
-                    content: "/tmp/timer-image-\(data.count).\(fileExtension)",
+                    content: "/tmp/timer-image-\(pngData.count).png",
                     preview: "timer image",
                     createdAt: observedAt,
                     managedOrigin: .clipboard
@@ -561,18 +816,454 @@ struct QuickStashViewModelTests {
         try expect(received[1].type == .url, "Timer did not classify a clipboard link")
 
         pasteboard.text = nil
-        pasteboard.pngData = Data([1, 2, 3, 4])
+        pasteboard.pngData = pngFixture
         pasteboard.changeCount = 103
         try await waitUntil { received.count == 3 }
         try expect(received[2].type == .image, "Timer did not capture a clipboard image")
 
         pasteboard.pngData = nil
-        pasteboard.tiffData = Data([0x49, 0x49, 0x2A, 0x00])
+        pasteboard.tiffData = tiffFixture
         pasteboard.changeCount = 104
         try await waitUntil { received.count == 4 }
         try expect(received[3].type == .image, "Timer did not capture a TIFF clipboard image")
-        try expect(received[3].content.hasSuffix(".tiff"), "TIFF clipboard data lost its format")
+        try expect(received[3].content.hasSuffix(".png"), "TIFF clipboard image was not normalized to PNG")
         try expect(received.allSatisfy { $0.managedOrigin == .clipboard }, "Timer changed clipboard origins")
+    }
+
+    @MainActor
+    private static func testSystemClipboardNormalizesImageFormatsAndFallback() throws {
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        let tiffData = try makeBitmapImageData(width: 128, height: 96, fileType: .tiff)
+        let expectedPNG = try ClipboardPNGEncoder.pngData(from: tiffData)
+        try expect(tiffData.count > expectedPNG.count, "TIFF fixture was not larger than normalized PNG")
+
+        let tiffReceipt = pasteboard.declareTypes([.png, .tiff], owner: nil)
+        try expect(pasteboard.setData(tiffData, forType: .tiff), "Named pasteboard rejected TIFF fixture")
+        try expect(pasteboard.changeCount == tiffReceipt, "TIFF fixture changed its declaration receipt")
+        let tiffSnapshot = SystemClipboardPasteboard(pasteboard: pasteboard).readPayloadSnapshot(
+            maximumImageBytes: expectedPNG.count,
+            maximumTextCharacters: 1_024
+        )
+        guard let tiffSnapshot,
+              case .image(let normalizedTIFF, let tiffExtension) = tiffSnapshot.payload else {
+            throw ViewModelTestFailure.assertion("Unavailable PNG flavor did not fall back to TIFF")
+        }
+        try expect(tiffExtension == "png", "TIFF fallback did not report PNG storage")
+        try expect(isPNG(normalizedTIFF), "TIFF fallback did not produce PNG bytes")
+        let tiffBitmap = NSBitmapImageRep(data: normalizedTIFF)
+        try expect(
+            tiffBitmap?.pixelsWide == 128 && tiffBitmap?.pixelsHigh == 96,
+            "TIFF normalization changed physical pixel dimensions"
+        )
+
+        let jpegData = try makeBitmapImageData(width: 73, height: 41, fileType: .jpeg)
+        let jpegType = NSPasteboard.PasteboardType("public.jpeg")
+        _ = pasteboard.declareTypes([jpegType], owner: nil)
+        try expect(pasteboard.setData(jpegData, forType: jpegType), "Named pasteboard rejected JPEG fixture")
+        let jpegSnapshot = SystemClipboardPasteboard(pasteboard: pasteboard).readPayloadSnapshot(
+            maximumImageBytes: ClipboardPNGEncoder.maximumOutputBytes,
+            maximumTextCharacters: 1_024
+        )
+        guard let jpegSnapshot,
+              case .image(let normalizedJPEG, let jpegExtension) = jpegSnapshot.payload else {
+            throw ViewModelTestFailure.assertion("JPEG-only pasteboard image was not captured")
+        }
+        try expect(jpegExtension == "png", "JPEG-only image did not report PNG storage")
+        try expect(isPNG(normalizedJPEG), "JPEG-only image did not produce PNG bytes")
+        let jpegBitmap = NSBitmapImageRep(data: normalizedJPEG)
+        try expect(
+            jpegBitmap?.pixelsWide == 73 && jpegBitmap?.pixelsHigh == 41,
+            "JPEG normalization changed physical pixel dimensions"
+        )
+
+        let oversizedPreferredPNG = try makeBitmapImageData(width: 512, height: 512, fileType: .png)
+        try expect(
+            oversizedPreferredPNG.count > expectedPNG.count,
+            "Preferred PNG fixture was not larger than its TIFF fallback"
+        )
+        _ = pasteboard.declareTypes([.png, .tiff], owner: nil)
+        try expect(
+            pasteboard.setData(oversizedPreferredPNG, forType: .png),
+            "Named pasteboard rejected oversized preferred PNG"
+        )
+        try expect(pasteboard.setData(tiffData, forType: .tiff), "Named pasteboard rejected TIFF fallback")
+        let oversizedPreferredSnapshot = SystemClipboardPasteboard(pasteboard: pasteboard).readPayloadSnapshot(
+            maximumImageBytes: expectedPNG.count,
+            maximumTextCharacters: 1_024
+        )
+        guard let oversizedPreferredSnapshot,
+              case .image(let fallbackPNG, _) = oversizedPreferredSnapshot.payload else {
+            throw ViewModelTestFailure.assertion("Oversized preferred PNG prevented a valid TIFF fallback")
+        }
+        try expect(isPNG(fallbackPNG), "Oversized preferred PNG fallback did not produce PNG bytes")
+
+        _ = pasteboard.declareTypes([.png, .tiff], owner: nil)
+        try expect(
+            pasteboard.setData(Data([0x89, 0x50, 0x4E, 0x47]), forType: .png),
+            "Named pasteboard rejected invalid preferred PNG"
+        )
+        let pendingFallbackSnapshot = SystemClipboardPasteboard(pasteboard: pasteboard).readPayloadSnapshot(
+            maximumImageBytes: ClipboardPNGEncoder.maximumOutputBytes,
+            maximumTextCharacters: 1_024
+        )
+        guard let pendingFallbackSnapshot,
+              case .pendingImage = pendingFallbackSnapshot.payload else {
+            throw ViewModelTestFailure.assertion(
+                "Invalid preferred flavor rejected an image before its declared fallback materialized"
+            )
+        }
+        let pendingFallbackCount = pasteboard.changeCount
+        try expect(
+            pasteboard.setData(tiffData, forType: .tiff),
+            "Named pasteboard rejected delayed TIFF fallback"
+        )
+        try expect(
+            pasteboard.changeCount == pendingFallbackCount,
+            "Delayed TIFF fallback unexpectedly changed the pasteboard generation"
+        )
+        let materializedFallbackSnapshot = SystemClipboardPasteboard(pasteboard: pasteboard).readPayloadSnapshot(
+            maximumImageBytes: ClipboardPNGEncoder.maximumOutputBytes,
+            maximumTextCharacters: 1_024
+        )
+        guard let materializedFallbackSnapshot,
+              case .image(let materializedFallback, let materializedExtension) = materializedFallbackSnapshot.payload else {
+            throw ViewModelTestFailure.assertion("Delayed same-count TIFF fallback was not captured")
+        }
+        try expect(
+            materializedExtension == "png" && isPNG(materializedFallback),
+            "Delayed TIFF fallback was not normalized to PNG"
+        )
+
+        guard let webPData = Data(base64Encoded:
+            "UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEALmk0mk0iIiIiIgBoSygABc6zbAAA"
+        ) else {
+            throw ViewModelTestFailure.assertion("Could not decode embedded WebP fixture")
+        }
+        let additionalFormats: [(UTType, Data, Int, Int)] = [
+            (.heic, try makeImageIOData(width: 37, height: 29, type: .heic), 37, 29),
+            (.webP, webPData, 1, 1)
+        ]
+        for (type, sourceData, width, height) in additionalFormats {
+            let pasteboardType = NSPasteboard.PasteboardType(type.identifier)
+            _ = pasteboard.declareTypes([pasteboardType], owner: nil)
+            try expect(
+                pasteboard.setData(sourceData, forType: pasteboardType),
+                "Named pasteboard rejected \(type.identifier) fixture"
+            )
+            let snapshot = SystemClipboardPasteboard(pasteboard: pasteboard).readPayloadSnapshot(
+                maximumImageBytes: ClipboardPNGEncoder.maximumOutputBytes,
+                maximumTextCharacters: 1_024
+            )
+            guard let snapshot,
+                  case .image(let normalizedData, let fileExtension) = snapshot.payload else {
+                throw ViewModelTestFailure.assertion("\(type.identifier)-only image was not captured")
+            }
+            let bitmap = NSBitmapImageRep(data: normalizedData)
+            try expect(fileExtension == "png" && isPNG(normalizedData), "\(type.identifier) was not normalized to PNG")
+            try expect(
+                bitmap?.pixelsWide == width && bitmap?.pixelsHigh == height,
+                "\(type.identifier) normalization changed pixel dimensions"
+            )
+        }
+
+        _ = pasteboard.declareTypes([.png, .string], owner: nil)
+        try expect(
+            pasteboard.setString("https://fallback.example", forType: .string),
+            "Named pasteboard rejected promised-image fallback text"
+        )
+        let promisedImageSnapshot = SystemClipboardPasteboard(pasteboard: pasteboard).readPayloadSnapshot(
+            maximumImageBytes: ClipboardPNGEncoder.maximumOutputBytes,
+            maximumTextCharacters: 1_024
+        )
+        guard let promisedImageSnapshot,
+              case .pendingImage(let fallbackText, _) = promisedImageSnapshot.payload else {
+            throw ViewModelTestFailure.assertion("Unavailable promised image did not retain fallback text")
+        }
+        try expect(fallbackText == "https://fallback.example", "Promised image fallback text changed")
+
+        _ = pasteboard.declareTypes([.png, .string], owner: nil)
+        try expect(
+            pasteboard.setData(Data([1, 2, 3, 4]), forType: .png),
+            "Named pasteboard rejected invalid PNG text-fallback fixture"
+        )
+        let delayedTextCount = pasteboard.changeCount
+        let delayedTextPending = SystemClipboardPasteboard(pasteboard: pasteboard).readPayloadSnapshot(
+            maximumImageBytes: ClipboardPNGEncoder.maximumOutputBytes,
+            maximumTextCharacters: 1_024
+        )
+        guard let delayedTextPending,
+              case .pendingImage = delayedTextPending.payload else {
+            throw ViewModelTestFailure.assertion("Unavailable text flavor did not keep an invalid image event pending")
+        }
+        try expect(
+            pasteboard.setString("same-count delayed text", forType: .string),
+            "Named pasteboard rejected delayed text fallback"
+        )
+        try expect(
+            pasteboard.changeCount == delayedTextCount,
+            "Delayed text fallback unexpectedly changed the pasteboard generation"
+        )
+        let delayedTextSnapshot = SystemClipboardPasteboard(pasteboard: pasteboard).readPayloadSnapshot(
+            maximumImageBytes: ClipboardPNGEncoder.maximumOutputBytes,
+            maximumTextCharacters: 1_024
+        )
+        guard let delayedTextSnapshot,
+              case .text(let delayedText) = delayedTextSnapshot.payload,
+              delayedText == "same-count delayed text" else {
+            throw ViewModelTestFailure.assertion("Invalid image permanently suppressed its delayed text fallback")
+        }
+    }
+
+    @MainActor
+    private static func testSystemClipboardHelperTimesOutBlockedFlavorAndUsesFallback() async throws {
+        let pasteboard = NSPasteboard.withUniqueName()
+        let provider = SlowPNGDataProvider(delay: 2)
+        defer { pasteboard.releaseGlobally() }
+        let tiffData = try makeBitmapImageData(width: 61, height: 47, fileType: .tiff)
+        let item = NSPasteboardItem()
+        item.setDataProvider(provider, forTypes: [.png])
+        try expect(item.setData(tiffData, forType: .tiff), "Could not attach ready TIFF fallback")
+        pasteboard.clearContents()
+        try expect(pasteboard.writeObjects([item]), "Could not publish blocking PNG provider fixture")
+
+        let reader = SystemClipboardPasteboard(pasteboard: pasteboard)
+        let (snapshot, readDuration) = await Task.detached {
+            let startedAt = Date()
+            let snapshot = reader.readPayloadSnapshot(
+                maximumImageBytes: ClipboardPNGEncoder.maximumOutputBytes,
+                maximumTextCharacters: 1_024
+            )
+            return (snapshot, Date().timeIntervalSince(startedAt))
+        }.value
+        try expect(readDuration < 1.5, "Blocked image provider exceeded helper timeout")
+        try expect(provider.invocationCount > 0, "Blocked image provider fixture was not requested")
+        guard let snapshot,
+              case .image(let normalizedData, let fileExtension) = snapshot.payload else {
+            throw ViewModelTestFailure.assertion("Blocked PNG provider prevented a ready TIFF fallback")
+        }
+        let bitmap = NSBitmapImageRep(data: normalizedData)
+        try expect(fileExtension == "png" && isPNG(normalizedData), "Blocked flavor fallback was not PNG")
+        try expect(
+            bitmap?.pixelsWide == 61 && bitmap?.pixelsHigh == 47,
+            "Blocked flavor fallback changed physical pixel dimensions"
+        )
+    }
+
+    @MainActor
+    private static func testClipboardPNGEncoderBoundariesAndMetadata() throws {
+        let alphaTIFF = try makeAlphaTIFFData()
+        let alphaPNG = try ClipboardPNGEncoder.pngData(from: alphaTIFF)
+        guard let alphaBitmap = NSBitmapImageRep(data: alphaPNG) else {
+            throw ViewModelTestFailure.assertion("Could not decode normalized alpha PNG")
+        }
+        let expectedAlpha: [Double] = [0, 64, 128, 255]
+        for (x, expected) in expectedAlpha.enumerated() {
+            guard let actual = alphaBitmap.colorAt(x: x, y: 0)?.alphaComponent else {
+                throw ViewModelTestFailure.assertion("Could not inspect normalized alpha pixel")
+            }
+            try expect(
+                abs((actual * 255) - expected) <= 1.5,
+                "TIFF-to-PNG normalization changed alpha at pixel \(x)"
+            )
+        }
+
+        let orientedJPEG = try makeImageIOData(width: 40, height: 20, type: .jpeg, orientation: 6)
+        let orientedPNG = try ClipboardPNGEncoder.pngData(from: orientedJPEG)
+        let orientedBitmap = NSBitmapImageRep(data: orientedPNG)
+        try expect(
+            orientedBitmap?.pixelsWide == 20 && orientedBitmap?.pixelsHigh == 40,
+            "EXIF orientation was not applied while normalizing to PNG"
+        )
+
+        let pngData = try makeBitmapImageData(fileType: .png)
+        do {
+            _ = try ClipboardPNGEncoder.pngData(
+                from: pngData,
+                maximumOutputBytes: pngData.count - 1
+            )
+            throw ViewModelTestFailure.assertion("PNG output limit accepted an oversized result")
+        } catch ClipboardPNGEncodingError.outputTooLarge {
+            // Expected.
+        }
+
+        do {
+            try ClipboardPNGEncoder.validateDimensions(
+                width: ClipboardPNGEncoder.maximumPixelDimension + 1,
+                height: 1
+            )
+            throw ViewModelTestFailure.assertion("PNG encoder accepted an excessive pixel dimension")
+        } catch ClipboardPNGEncodingError.dimensionsTooLarge {
+            // Expected.
+        }
+
+        do {
+            try ClipboardPNGEncoder.validateDimensions(width: 8_192, height: 8_193)
+            throw ViewModelTestFailure.assertion("PNG encoder accepted an excessive decoded-memory estimate")
+        } catch ClipboardPNGEncodingError.dimensionsTooLarge {
+            // Expected.
+        }
+
+        do {
+            _ = try ClipboardPNGEncoder.pngData(from: Data([1, 2, 3, 4]))
+            throw ViewModelTestFailure.assertion("PNG encoder accepted invalid image bytes")
+        } catch ClipboardPNGEncodingError.invalidImage {
+            // Expected.
+        }
+
+        do {
+            _ = try ClipboardPNGEncoder.pngData(from: Data(pngData.prefix(32)))
+            throw ViewModelTestFailure.assertion("PNG encoder accepted incomplete image bytes")
+        } catch ClipboardPNGEncodingError.sourceIncomplete {
+            // Expected.
+        }
+
+        guard let webPData = Data(base64Encoded:
+            "UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEALmk0mk0iIiIiIgBoSygABc6zbAAA"
+        ) else {
+            throw ViewModelTestFailure.assertion("Could not decode incomplete WebP fixture source")
+        }
+        let incompleteRasterHeaders = [
+            Data([0xFF, 0xD8]),
+            Data([0x49, 0x49, 0x2A, 0x00]),
+            Data(webPData.prefix(16))
+        ]
+        for header in incompleteRasterHeaders {
+            do {
+                _ = try ClipboardPNGEncoder.pngData(from: header)
+                throw ViewModelTestFailure.assertion("PNG encoder accepted an incomplete raster header")
+            } catch ClipboardPNGEncodingError.sourceIncomplete {
+                // Expected.
+            }
+        }
+
+        var corruptedPNG = pngData
+        corruptedPNG[corruptedPNG.count / 2] ^= 0xFF
+        do {
+            _ = try ClipboardPNGEncoder.pngData(from: corruptedPNG)
+            throw ViewModelTestFailure.assertion("PNG encoder accepted a corrupted pixel stream")
+        } catch ClipboardPNGEncodingError.invalidImage {
+            // Expected.
+        }
+    }
+
+    @MainActor
+    private static func testPromisedImageFallsBackToText() async throws {
+        let suite = "QuickStashTests.clipboard.promised-image-fallback.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create promised-image fallback defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let pasteboard = FakeClipboardPasteboard()
+        pasteboard.changeCount = 1_350
+        pasteboard.enqueueForcedSnapshot(ClipboardPayloadSnapshot(
+            changeCount: 1_351,
+            payload: .pendingImage(fallbackText: "https://fallback.example")
+        ))
+        var received: [StashItem] = []
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: pasteboard,
+            imageSaver: { _, _, _ in throw CocoaError(.fileWriteUnknown) }
+        )
+        monitor.onNewItem = { received.append($0) }
+        monitor.setConsent(.enabled)
+
+        pasteboard.changeCount = 1_351
+        monitor.checkClipboard()
+        try await waitUntil(description: "promised image fallback read") {
+            pasteboard.payloadReadCount == 1
+        }
+        pasteboard.text = "newer text"
+        pasteboard.changeCount = 1_352
+        monitor.checkClipboard()
+        try await waitUntil(description: "promised image fallback publication") {
+            received.count == 2
+        }
+        try expect(
+            received.contains(where: {
+                $0.type == .url && $0.content == "https://fallback.example"
+            }),
+            "Unavailable promised image dropped its URL fallback"
+        )
+        try expect(
+            received.contains(where: { $0.type == .text && $0.content == "newer text" }),
+            "Promised image fallback suppressed the newer text"
+        )
+        monitor.stopMonitoring()
+    }
+
+    @MainActor
+    private static func testPendingImageRetryReportsTerminalError() async throws {
+        let suite = "QuickStashTests.clipboard.pending-image-error.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create pending-image error defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let pasteboard = FakeClipboardPasteboard()
+        pasteboard.changeCount = 1_400
+        let message = "clipboard image provider fixture timed out"
+        for _ in 0..<12 {
+            pasteboard.enqueueForcedSnapshot(ClipboardPayloadSnapshot(
+                changeCount: 1_401,
+                payload: .pendingImage(fallbackText: nil, failureMessage: message)
+            ))
+        }
+        var received: [StashItem] = []
+        var errors: [String] = []
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: pasteboard,
+            imageSaver: { _, _, _ in throw CocoaError(.fileWriteUnknown) }
+        )
+        monitor.onNewItem = { received.append($0) }
+        monitor.onError = { errors.append($0) }
+        monitor.setConsent(.enabled)
+
+        pasteboard.changeCount = 1_401
+        monitor.checkClipboard()
+        try await waitUntil(timeout: 4, description: "pending image terminal error") {
+            errors == [message]
+        }
+        try expect(received.isEmpty, "Permanently pending image published an invalid fallback")
+        try expect(pasteboard.payloadReadCount == 13, "Pending image did not use the bounded retry count")
+        monitor.stopMonitoring()
+    }
+
+    @MainActor
+    private static func testClipboardStorageAndLegacyRepublishUsePNG(in root: URL) async throws {
+        let base = root.appendingPathComponent("clipboard-png-storage", isDirectory: true)
+        let fileManager = QuickStashFileManager(baseDirectory: base)
+        let tiffData = try makeBitmapImageData(width: 91, height: 57, fileType: .tiff)
+
+        let stored = try await fileManager.saveClipboardImage(
+            data: tiffData,
+            fileExtension: "tiff"
+        )
+        let storedURL = URL(fileURLWithPath: stored.content)
+        let storedData = try Data(contentsOf: storedURL)
+        try expect(storedURL.pathExtension == "png", "New clipboard image retained its TIFF extension")
+        try expect(isPNG(storedData), "New clipboard image used a PNG extension without PNG bytes")
+
+        let legacyURL = fileManager.imagesDirectory
+            .appendingPathComponent("legacy-clipboard-image")
+            .appendingPathExtension("tiff")
+        try tiffData.write(to: legacyURL, options: .atomic)
+        let payload = try await fileManager.readManagedImage(at: legacyURL.path)
+        try expect(payload.pasteboardType == .png, "Legacy TIFF was republished with a TIFF pasteboard type")
+        try expect(isPNG(payload.data), "Legacy TIFF was not converted to PNG for clipboard publishing")
+        let bitmap = NSBitmapImageRep(data: payload.data)
+        try expect(
+            bitmap?.pixelsWide == 91 && bitmap?.pixelsHigh == 57,
+            "Legacy TIFF conversion changed physical pixel dimensions"
+        )
+        let unchangedLegacyData = try Data(contentsOf: legacyURL)
+        try expect(
+            unchangedLegacyData == tiffData,
+            "Reading a legacy TIFF unexpectedly migrated or rewrote its history file"
+        )
     }
 
     @MainActor
@@ -617,14 +1308,14 @@ struct QuickStashViewModelTests {
         try expect(pasteboard.changeCount == 401, "Test advanced changeCount while publishing payload")
         try await Task.sleep(nanoseconds: 100_000_000)
         try expect(received.count == 1, "Same-count clipboard payload was published more than once")
-        try expect(pasteboard.payloadReadCount == 6, "Late text did not complete its stability window")
+        try expect(pasteboard.payloadReadCount == 2, "Late text was read more than once after becoming available")
 
         pasteboard.text = nil
         pasteboard.emptyReadsRemaining = 1
         pasteboard.changeCount = 402
         monitor.checkClipboard()
         try await waitUntil(description: "forced empty image read") {
-            pasteboard.payloadReadCount == 7 && pasteboard.emptyReadsRemaining == 0
+            pasteboard.payloadReadCount == 3 && pasteboard.emptyReadsRemaining == 0
         }
 
         pasteboard.pngData = Data([0x89, 0x50, 0x4E, 0x47])
@@ -633,7 +1324,7 @@ struct QuickStashViewModelTests {
         try expect(pasteboard.changeCount == 402, "Image test advanced changeCount while publishing payload")
         try await Task.sleep(nanoseconds: 100_000_000)
         try expect(received.count == 2, "Same-count clipboard image was published more than once")
-        try expect(pasteboard.payloadReadCount == 8, "Empty image snapshot was not retried exactly once")
+        try expect(pasteboard.payloadReadCount == 4, "Empty image snapshot was not retried exactly once")
     }
 
     @MainActor
@@ -665,6 +1356,12 @@ struct QuickStashViewModelTests {
 
         pasteboard.text = "图片发布前的中间文字表示"
         pasteboard.changeCount = 451
+        for _ in 0..<4 {
+            pasteboard.enqueueForcedSnapshot(ClipboardPayloadSnapshot(
+                changeCount: 451,
+                payload: .pendingImage(fallbackText: "图片发布前的中间文字表示")
+            ))
+        }
         monitor.checkClipboard()
         try await waitUntil(description: "slow same-count image publication window") {
             pasteboard.payloadReadCount == 4 && received.isEmpty
@@ -723,6 +1420,10 @@ struct QuickStashViewModelTests {
         let imageObservedAt = Date(timeIntervalSince1970: 1_701_000_000)
         pasteboard.text = "图片尚未完成时的文字表示"
         pasteboard.changeCount = 701
+        pasteboard.enqueueForcedSnapshot(ClipboardPayloadSnapshot(
+            changeCount: 701,
+            payload: .pendingImage(fallbackText: "图片尚未完成时的文字表示")
+        ))
         monitor.checkClipboard(observedAt: imageObservedAt)
         try await waitUntil(description: "initial provisional image text") {
             pasteboard.payloadReadCount == 1
@@ -855,16 +1556,22 @@ struct QuickStashViewModelTests {
         let oldObservedAt = Date(timeIntervalSince1970: 1_700_900_000)
         pasteboard.text = "确认窗口中的旧文字"
         pasteboard.changeCount = 651
+        pasteboard.enqueueForcedSnapshot(ClipboardPayloadSnapshot(
+            changeCount: 651,
+            payload: .pendingImage(fallbackText: "确认窗口中的旧文字")
+        ))
         monitor.checkClipboard(observedAt: oldObservedAt)
         try await waitUntil(description: "provisional text confirmation") {
-            pasteboard.payloadReadCount >= 2 && received.isEmpty
+            pasteboard.payloadReadCount == 1 && received.isEmpty
         }
 
         let newObservedAt = oldObservedAt.addingTimeInterval(1)
         pasteboard.text = "确认窗口之后的新文字"
         pasteboard.changeCount = 652
         monitor.checkClipboard(observedAt: newObservedAt)
-        try expect(received.map(\.content) == ["确认窗口中的旧文字"], "Advancing count did not finalize provisional text")
+        try await waitUntil(description: "superseded provisional text finalization") {
+            received.contains(where: { $0.content == "确认窗口中的旧文字" })
+        }
 
         try await waitUntil(description: "new text after provisional finalization") {
             received.count == 2
@@ -1025,6 +1732,327 @@ struct QuickStashViewModelTests {
     }
 
     @MainActor
+    private static func testClipboardAcceptsLateImageAfterSoftTimeout() async throws {
+        let suite = "QuickStashTests.clipboard.late-image.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create late-image defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let pasteboard = FakeClipboardPasteboard()
+        pasteboard.changeCount = 900
+        let blockedRead = DispatchSemaphore(value: 0)
+        pasteboard.readGate = blockedRead
+        let pngData = try makeBitmapImageData(fileType: .png)
+        pasteboard.enqueueForcedSnapshot(ClipboardPayloadSnapshot(
+            changeCount: 901,
+            payload: .image(pngData, fileExtension: "png")
+        ))
+        var received: [StashItem] = []
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: pasteboard,
+            readTimeoutInterval: 0.05,
+            imageSaver: { data, _, observedAt in
+                StashItem(
+                    type: .image,
+                    content: "/tmp/late-image-\(data.count).png",
+                    preview: "late image",
+                    createdAt: observedAt,
+                    managedOrigin: .clipboard
+                )
+            }
+        )
+        monitor.onNewItem = { received.append($0) }
+        monitor.setConsent(.enabled)
+
+        pasteboard.changeCount = 901
+        monitor.checkClipboard()
+        try await waitUntil(description: "late image provider started") {
+            pasteboard.payloadReadCount == 1
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        blockedRead.signal()
+        try await waitUntil(description: "late image accepted after soft timeout") {
+            received.count == 1
+        }
+        try expect(received[0].type == .image, "Late provider result changed item type")
+        try expect(pasteboard.payloadReadCount == 1, "Soft timeout spawned duplicate reads for one count")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try expect(received.count == 1, "Late provider image was committed more than once")
+        monitor.stopMonitoring()
+    }
+
+    @MainActor
+    private static func testTimedOutImageUpgradeSurvivesNewerCopy(in root: URL) async throws {
+        let suite = "QuickStashTests.clipboard.timed-out-upgrade.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create timed-out upgrade defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let pasteboard = FakeClipboardPasteboard()
+        pasteboard.changeCount = 1_100
+        let viewModelRoot = root.appendingPathComponent("timed-out-image-upgrade", isDirectory: true)
+        let viewModel = StashViewModel(
+            storageManager: StorageManager(baseDirectory: viewModelRoot.appendingPathComponent("metadata")),
+            fileManager: QuickStashFileManager(baseDirectory: viewModelRoot.appendingPathComponent("files")),
+            loadOnInit: false,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {}
+        )
+        let pngData = try makeBitmapImageData(fileType: .png)
+        let blockedImageRead = DispatchSemaphore(value: 0)
+        var received: [StashItem] = []
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: pasteboard,
+            readTimeoutInterval: 0.05,
+            imageSaver: { data, _, observedAt in
+                StashItem(
+                    type: .image,
+                    content: "/tmp/timed-out-upgrade-\(data.count).png",
+                    preview: "timed-out upgrade image",
+                    createdAt: observedAt,
+                    managedOrigin: .clipboard
+                )
+            }
+        )
+        monitor.onNewItem = {
+            received.append($0)
+            viewModel.addItem($0)
+        }
+        monitor.setConsent(.enabled)
+
+        let imageObservedAt = Date(timeIntervalSince1970: 1_702_000_000)
+        pasteboard.text = "超时图片的中间文字"
+        pasteboard.changeCount = 1_101
+        pasteboard.enqueueForcedSnapshot(ClipboardPayloadSnapshot(
+            changeCount: 1_101,
+            payload: .pendingImage(fallbackText: "超时图片的中间文字")
+        ))
+        monitor.checkClipboard(observedAt: imageObservedAt)
+        try await waitUntil(description: "timed-out upgrade provisional text") {
+            pasteboard.payloadReadCount == 1 && received.isEmpty
+        }
+        pasteboard.readGate = blockedImageRead
+        pasteboard.enqueueForcedSnapshot(ClipboardPayloadSnapshot(
+            changeCount: 1_101,
+            payload: .image(pngData, fileExtension: "png")
+        ))
+        try await waitUntil(description: "timed-out image upgrade read") {
+            pasteboard.payloadReadCount == 2
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        let textObservedAt = imageObservedAt.addingTimeInterval(1)
+        pasteboard.pngData = nil
+        pasteboard.text = "图片之后的新文字"
+        pasteboard.changeCount = 1_102
+        monitor.checkClipboard(observedAt: textObservedAt)
+        try expect(received.isEmpty, "New count finalized a timed-out image's provisional text")
+        try await waitUntil(description: "new count beside timed-out image") {
+            pasteboard.payloadReadCount >= 3
+        }
+        blockedImageRead.signal()
+
+        try await waitUntil(description: "timed-out image and newer text") {
+            received.count == 2
+        }
+        try expect(received.filter { $0.type == .image }.count == 1, "Timed-out image upgrade was lost")
+        try expect(
+            !received.contains(where: { $0.content == "超时图片的中间文字" }),
+            "Timed-out image provisional text leaked into history"
+        )
+        try expect(
+            viewModel.items.map(\.type) == [.text, .image],
+            "Timed-out image and newer text were not ordered by observation time"
+        )
+        monitor.stopMonitoring()
+        await viewModel.flushForTermination()
+    }
+
+    @MainActor
+    private static func testLateReadCannotConsumeNewerCount() async throws {
+        let suite = "QuickStashTests.clipboard.late-count-binding.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create late count-binding defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let pasteboard = FakeClipboardPasteboard()
+        pasteboard.changeCount = 1_200
+        let blockedOldRead = DispatchSemaphore(value: 0)
+        pasteboard.readGate = blockedOldRead
+        pasteboard.enqueueForcedSnapshot(ClipboardPayloadSnapshot(
+            changeCount: 1_202,
+            payload: .text("旧 lane 不得提交的新计数内容")
+        ))
+        var received: [StashItem] = []
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: pasteboard,
+            readTimeoutInterval: 0.05,
+            imageSaver: { _, _, _ in throw CocoaError(.fileWriteUnknown) }
+        )
+        monitor.onNewItem = { received.append($0) }
+        monitor.setConsent(.enabled)
+
+        let oldObservedAt = Date(timeIntervalSince1970: 1_703_000_000)
+        pasteboard.text = "旧内容"
+        pasteboard.changeCount = 1_201
+        monitor.checkClipboard(observedAt: oldObservedAt)
+        try await waitUntil(description: "old count provider") { pasteboard.payloadReadCount == 1 }
+
+        let newObservedAt = oldObservedAt.addingTimeInterval(1)
+        pasteboard.text = "新计数的真实内容"
+        pasteboard.changeCount = 1_202
+        monitor.checkClipboard(observedAt: newObservedAt)
+        try await waitUntil(description: "new count provider") { pasteboard.payloadReadCount >= 2 }
+        blockedOldRead.signal()
+        try await waitUntil(description: "correctly bound new count") { received.count == 1 }
+        try expect(received[0].content == "新计数的真实内容", "Late old lane consumed the newer snapshot")
+        try expect(received[0].createdAt == newObservedAt, "New count inherited the old observation timestamp")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try expect(received.count == 1, "Late old lane published after the newer count")
+        monitor.stopMonitoring()
+    }
+
+    @MainActor
+    private static func testLateTextStillWaitsForSameCountImage() async throws {
+        let suite = "QuickStashTests.clipboard.late-text-upgrade.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create late text-upgrade defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let pasteboard = FakeClipboardPasteboard()
+        pasteboard.changeCount = 1_300
+        let blockedRead = DispatchSemaphore(value: 0)
+        pasteboard.readGate = blockedRead
+        pasteboard.enqueueForcedSnapshot(ClipboardPayloadSnapshot(
+            changeCount: 1_301,
+            payload: .pendingImage(fallbackText: "迟到的图片中间文字")
+        ))
+        let pngData = try makeBitmapImageData(fileType: .png)
+        var received: [StashItem] = []
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: pasteboard,
+            readTimeoutInterval: 0.05,
+            imageSaver: { data, _, observedAt in
+                StashItem(
+                    type: .image,
+                    content: "/tmp/late-text-upgrade-\(data.count).png",
+                    preview: "late text upgrade",
+                    createdAt: observedAt,
+                    managedOrigin: .clipboard
+                )
+            }
+        )
+        monitor.onNewItem = { received.append($0) }
+        monitor.setConsent(.enabled)
+
+        pasteboard.text = "迟到的图片中间文字"
+        pasteboard.changeCount = 1_301
+        monitor.checkClipboard()
+        try await waitUntil(description: "late text provider") { pasteboard.payloadReadCount == 1 }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        blockedRead.signal()
+        pasteboard.pngData = pngData
+
+        try await waitUntil(description: "same-count image after late text") { received.count == 1 }
+        try expect(received[0].type == .image, "Late text was committed before its same-count image")
+        try expect(
+            !received.contains(where: { $0.content == "迟到的图片中间文字" }),
+            "Late provisional text leaked into history"
+        )
+        monitor.stopMonitoring()
+    }
+
+    @MainActor
+    private static func testClipboardPayloadReadLaneCapAndBoundedDrain() async throws {
+        let suite = "QuickStashTests.clipboard.reader-cap.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create reader-cap defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let pasteboard = FakeClipboardPasteboard()
+        pasteboard.changeCount = 1_400
+        let firstBlockedRead = DispatchSemaphore(value: 0)
+        let secondBlockedRead = DispatchSemaphore(value: 0)
+        pasteboard.readGate = firstBlockedRead
+        var received: [StashItem] = []
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: pasteboard,
+            readTimeoutInterval: 0.05,
+            imageSaver: { _, _, _ in throw CocoaError(.fileWriteUnknown) }
+        )
+        monitor.onNewItem = { received.append($0) }
+        monitor.setConsent(.enabled)
+
+        pasteboard.text = "blocked-1"
+        pasteboard.changeCount = 1_401
+        monitor.checkClipboard()
+        try await waitUntil(description: "first blocked provider") { pasteboard.payloadReadCount == 1 }
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        pasteboard.readGate = secondBlockedRead
+        pasteboard.text = "blocked-2"
+        pasteboard.changeCount = 1_402
+        monitor.checkClipboard()
+        try await waitUntil(description: "second blocked provider") { pasteboard.payloadReadCount == 2 }
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        monitor.stopMonitoring()
+        monitor.startMonitoring()
+        for count in 1_403...1_412 {
+            pasteboard.text = "latest-\(count)"
+            pasteboard.changeCount = count
+            monitor.checkClipboard()
+        }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        try expect(pasteboard.payloadReadCount == 2, "Blocked providers exceeded the two-lane cap")
+        try expect(pasteboard.maximumConcurrentReaders == 2, "Reader lane cap allowed excess concurrency")
+
+        firstBlockedRead.signal()
+        try await waitUntil(description: "latest pending read after lane release") {
+            received.count == 1
+        }
+        try expect(received[0].content == "latest-1412", "Lane release did not retain only the latest pending count")
+        try expect(pasteboard.maximumConcurrentReaders == 2, "Replacement read exceeded the lane cap")
+        secondBlockedRead.signal()
+        monitor.stopMonitoring()
+
+        let drainPasteboard = FakeClipboardPasteboard()
+        drainPasteboard.changeCount = 1_500
+        let neverReturningRead = DispatchSemaphore(value: 0)
+        drainPasteboard.readGate = neverReturningRead
+        let drainMonitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: drainPasteboard,
+            readTimeoutInterval: 0.05,
+            imageSaver: { _, _, _ in throw CocoaError(.fileWriteUnknown) }
+        )
+        drainMonitor.setConsent(.enabled)
+        drainPasteboard.text = "blocked drain"
+        drainPasteboard.changeCount = 1_501
+        drainMonitor.checkClipboard()
+        try await waitUntil(description: "bounded drain provider") { drainPasteboard.payloadReadCount == 1 }
+        let drainStart = ProcessInfo.processInfo.systemUptime
+        await drainMonitor.shutdownAndDrain(
+            waitForPayloadReads: true,
+            payloadReadDrainTimeout: 0.05
+        )
+        let drainElapsed = ProcessInfo.processInfo.systemUptime - drainStart
+        try expect(drainElapsed < 0.5, "Payload drain waited indefinitely for a blocked provider")
+        neverReturningRead.signal()
+    }
+
+    @MainActor
     private static func testClipboardReadTimeoutRecoversForLaterCopy() async throws {
         let suite = "QuickStashTests.clipboard.read-timeout.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suite) else {
@@ -1067,6 +2095,72 @@ struct QuickStashViewModelTests {
         try await Task.sleep(nanoseconds: 100_000_000)
         try expect(received.count == 1, "Timed-out clipboard read published after its replacement")
         monitor.stopMonitoring()
+    }
+
+    @MainActor
+    private static func testClipboardImageSaveRetriesTransientFailure() async throws {
+        let suite = "QuickStashTests.clipboard.image-save-retry.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create image-save retry defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let pasteboard = FakeClipboardPasteboard()
+        pasteboard.changeCount = 950
+        pasteboard.pngData = try makeBitmapImageData(fileType: .png)
+        let saver = FailOnceClipboardImageSaver()
+        var received: [StashItem] = []
+        var errors: [String] = []
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: pasteboard,
+            imageSaver: { data, _, observedAt in
+                try await saver.save(data: data, observedAt: observedAt)
+            }
+        )
+        monitor.onNewItem = { received.append($0) }
+        monitor.onError = { errors.append($0) }
+        monitor.setConsent(.enabled)
+
+        pasteboard.changeCount = 951
+        monitor.checkClipboard()
+        try await waitUntil(description: "clipboard image save retry") {
+            received.count == 1
+        }
+        try expect(saver.callCount == 2, "Transient image save was not retried exactly once")
+        try expect(errors.isEmpty, "Successful image save retry reported a terminal error")
+        try expect(received[0].type == .image, "Retried image save changed item type")
+        monitor.stopMonitoring()
+    }
+
+    @MainActor
+    private static func testClipboardImageSaveCancellationStopsRetry() async throws {
+        let suite = "QuickStashTests.clipboard.image-save-cancel.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create image-save cancellation defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let pasteboard = FakeClipboardPasteboard()
+        pasteboard.changeCount = 975
+        pasteboard.pngData = try makeBitmapImageData(fileType: .png)
+        let saver = AlwaysFailClipboardImageSaver()
+        var errors: [String] = []
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: pasteboard,
+            imageSaver: { _, _, _ in try await saver.save() }
+        )
+        monitor.onError = { errors.append($0) }
+        monitor.setConsent(.enabled)
+
+        pasteboard.changeCount = 976
+        monitor.checkClipboard()
+        try await waitUntil(description: "first failing image-save attempt") { saver.callCount == 1 }
+        monitor.stopMonitoring()
+        try await Task.sleep(nanoseconds: 350_000_000)
+        try expect(saver.callCount == 1, "Cancelled image save started another retry")
+        try expect(errors.isEmpty, "Cancelled image save reported a stale terminal error")
     }
 
     @MainActor
@@ -1133,7 +2227,7 @@ struct QuickStashViewModelTests {
         gate.signal()
         try await waitUntil { received.count == 1 }
         try expect(received[0].content == "latest", "Latest pending clipboard change was not retained")
-        try expect(pasteboard.payloadReadCount == 5, "Stable latest text did not complete its stability window")
+        try expect(pasteboard.payloadReadCount == 2, "Stable latest text was read more than once")
         try expect(pasteboard.maximumConcurrentReaders == 1, "Pending payload overlapped the active reader")
         try expect(!pasteboard.readOccurredOnMainThread, "Pasteboard payload was read on the main thread")
     }
@@ -1231,8 +2325,8 @@ struct QuickStashViewModelTests {
         pasteboard.text = content
         pasteboard.changeCount = 901
         monitor.checkClipboard()
-        try await waitUntil(description: "graceful provisional \(expectedType.rawValue)") {
-            pasteboard.payloadReadCount >= 2 && viewModel.items.isEmpty
+        try await waitUntil(description: "graceful stable \(expectedType.rawValue)") {
+            pasteboard.payloadReadCount == 1 && viewModel.items.count == 1
         }
 
         await monitor.shutdownForTermination(settleNanoseconds: 0)
@@ -1536,7 +2630,7 @@ struct QuickStashViewModelTests {
         )
         let oldDate = Date(timeIntervalSince1970: 1_000_000)
         let image = try await fileManager.saveClipboardImage(
-            data: Data([4, 5, 6]),
+            data: try makeBitmapImageData(fileType: .png),
             fileExtension: "png",
             createdAt: oldDate
         )
@@ -1571,8 +2665,9 @@ struct QuickStashViewModelTests {
         let filesBase = base.appendingPathComponent("files", isDirectory: true)
         let metadataBase = base.appendingPathComponent("metadata", isDirectory: true)
         let fileManager = QuickStashFileManager(baseDirectory: filesBase)
-        let oldOrphan = try await fileManager.saveClipboardImage(data: Data([1]), fileExtension: "png")
-        let freshOrphan = try await fileManager.saveClipboardImage(data: Data([2]), fileExtension: "png")
+        let pngFixture = try makeBitmapImageData(fileType: .png)
+        let oldOrphan = try await fileManager.saveClipboardImage(data: pngFixture, fileExtension: "png")
+        let freshOrphan = try await fileManager.saveClipboardImage(data: pngFixture, fileExtension: "png")
         let oldFileName = URL(fileURLWithPath: oldOrphan.content).lastPathComponent
         let freshFileName = URL(fileURLWithPath: freshOrphan.content).lastPathComponent
         let now = Date(timeIntervalSince1970: 2_200_000_000)
@@ -1652,8 +2747,9 @@ struct QuickStashViewModelTests {
             baseDirectory: base.appendingPathComponent("files", isDirectory: true),
             cleanupFaultInjector: { try injector.inject($0) }
         )
-        let firstImage = try await fileManager.saveClipboardImage(data: Data([1]), fileExtension: "png")
-        let secondImage = try await fileManager.saveClipboardImage(data: Data([2]), fileExtension: "png")
+        let pngFixture = try makeBitmapImageData(fileType: .png)
+        let firstImage = try await fileManager.saveClipboardImage(data: pngFixture, fileExtension: "png")
+        let secondImage = try await fileManager.saveClipboardImage(data: pngFixture, fileExtension: "png")
         injector.select(URL(fileURLWithPath: secondImage.content))
         let text = StashItem(
             type: .text,

@@ -1,12 +1,12 @@
-# QuickStash 1.1.0 (2) 修复与交付审计
+# QuickStash 1.1.0 (3) 修复与交付审计
 
-更新时间：2026-07-28
+更新时间：2026-08-27
 
 ## 结论
 
 本轮已完成菜单栏拖文件卡死修复、普通窗口拖近图标误弹修复、文件导入工程化、截图功能，以及文字、HTTP(S) 链接和图片的实时剪贴板历史同步。全局拖动事件不读取拖拽剪贴板或协调源文件，只武装不可见接收层；只有 AppKit 确认真正的 `.fileURL` 拖放后才显示收录界面。普通窗口标题栏拖动不会显示收录窗或悬停预览，Finder 文件靠近自动显示能力保留。复制、目录遍历、持久化、恢复、截图渲染、编码和保存均不在主线程执行。
 
-版本号已统一为 `1.1.0 (2)`。截图使用 ScreenCaptureKit，不使用 `CGWindowListCreateImage`，没有外部依赖、辅助功能权限请求或虚构的 plist 截图权限键。
+版本号已统一为 `1.1.0 (3)`。截图使用 ScreenCaptureKit，不使用 `CGWindowListCreateImage`，没有外部依赖、辅助功能权限请求或虚构的 plist 截图权限键。
 
 ## 拖放与文件管线
 
@@ -27,7 +27,7 @@
 - 临时副本进入 `Importing`，完成后原子移动；取消或失败会回滚本批已提交项目并持久化未完成清理状态。
 - 导入、删除和孤儿恢复使用持久化 manifest。应用重启后可恢复已复制但尚未进入 metadata 的文件，并清理 partial、orphan 和中断删除状态。
 - `items.json` 采用带 schema version 的原子写入，支持旧数组迁移、损坏备份、未来版本只读保护、revision 去旧和退出前异步 flush。
-- 剪贴板首次使用要求明确授权，“启用实时记录”为主操作；监听可关闭，以 `0.25` 秒间隔记录文字、HTTP(S) 链接、PNG 和 TIFF，过滤常见 concealed/transient 类型，并有限额和保留数量/期限。后台读取绑定稳定 `changeCount`，内部写入只抑制自己的精确计数，不再取消已经稳定读到的外部图片。正常退出会在有界等待后确认最后一条 provisional 文字或链接、排空进行中的图片保存并刷盘，重启恢复时不会重复记录。
+- 剪贴板首次使用要求明确授权，“启用实时记录”为主操作；监听可关闭，以 `0.25` 秒间隔记录文字、HTTP(S) 链接及系统可解码图片，过滤常见 concealed/transient 类型，并有限额和保留数量/期限。PNG、TIFF、JPEG、HEIC/HEIF、WebP 等来源统一转为真实 PNG 落盘。纯文字和 URL 一次稳定读取即提交；只有明确声明但尚未就绪的图片表示才保留后备文字并有限重试。后台读取绑定稳定 `changeCount`，最多保留两条物理 provider lane；软超时后的迟到结果只能提交原计数，内部写入只抑制自己的精确计数。正常退出会排空进行中的图片保存并刷盘，重启恢复时不会重复记录。
 - `FailSelectedQuarantine` 按标准化源路径注入一次失败，不再依赖 `Set<UUID>` 的无序遍历；临时 `phase3:` 输出已删除。
 
 ## 截图实现
@@ -84,8 +84,8 @@
 6. `SWIFT_TREAT_WARNINGS_AS_ERRORS=YES`：通过。
 7. Xcode Analyze：通过。
 8. Hosted XCTest：33/33 通过、0 失败、0 跳过；除原有截图/IME/输出与拖放覆盖外，覆盖箭杆非线性压缩、端点拉伸不增粗、自动窗口圆角、圆角滑动事务与撤销/重做、PNG 透明角、JPEG 白底合成、慢文件提交期间 MainActor 不阻塞，以及最后一条文字、URL 和进行中图片在正常退出后的持久化恢复。
-9. Thread Sanitizer Hosted XCTest：33/33 通过、0 失败、0 跳过，未报告数据竞争。
-10. 坐标、多屏混合缩放、8 手柄、箭杆缩放、自动/手调圆角、100 步 undo/redo、真实 `NSTextView` IME、快捷键冲突、PNG/JPEG、文字/URL/PNG/TIFF 剪贴板和像素方向：通过。
+9. Thread Sanitizer Hosted XCTest：排除依赖未插桩 helper 读取系统剪贴板的单个跨进程用例后 32/32 通过；剪贴板 ViewModel、helper 超时和 `changeCount` 状态机另以独立 TSan 可执行文件通过，均未报告数据竞争。正常 Hosted XCTest 仍为 33/33。
+10. 坐标、多屏混合缩放、8 手柄、箭杆缩放、自动/手调圆角、100 步 undo/redo、真实 `NSTextView` IME、快捷键冲突、PNG/JPEG、文字/URL/PNG/TIFF/JPEG/HEIC/WebP 剪贴板和像素方向：通过。
 11. 截图与拖文件互斥 generation token：通过。
 12. 100 轮合成截图会话 gate、确定性 pre-cancel、命名剪贴板复制、PNG 保存和 JPEG 保存完整组件压力：通过。
 13. 主线程同步 I/O、信号量等待和死锁风险静态审计：通过；输出锁跨 `rename/remove` 的风险已修复并由阻塞注入测试覆盖，边界见上一节。

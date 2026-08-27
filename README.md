@@ -6,7 +6,7 @@
 
 QuickStash 是一款原生 macOS 菜单栏工具，用于临时收录文件、实时记录剪贴板内容，以及完成带标注的区域截图。项目基于 AppKit、SwiftUI、ScreenCaptureKit 和 Carbon 构建，不依赖第三方运行库。
 
-当前版本：`1.1.0 (2)`
+当前版本：`1.1.0 (3)`
 
 > 本仓库为私有源码仓库。代码未附带开源许可证，不授予复制、再分发或商用授权。
 
@@ -15,9 +15,11 @@ QuickStash 是一款原生 macOS 菜单栏工具，用于临时收录文件、�
 ### 剪贴板历史
 
 - 首次启用前要求应用内明确授权，之后可随时在设置中关闭。
-- 每 `0.25` 秒检查一次系统剪贴板，记录普通文字、显式或纯文本 HTTP(S) 链接、PNG 和 TIFF。
+- 每 `0.25` 秒检查一次系统剪贴板，记录普通文字、显式或纯文本 HTTP(S) 链接，以及 PNG、TIFF、JPEG、HEIC/HEIF、WebP 等系统可解码图片。
+- 所有新剪贴板图片都会在后台解码、校正 EXIF 方向并统一编码为真实 PNG 后写入 `Images`；旧 TIFF 历史复制出去时也会在内存中转换为 PNG，不改写旧历史文件。
 - QuickStash 自身复制的截图 PNG 也会在系统剪贴板写入成功后准确记录一次。
-- 通过稳定的 `changeCount`、串行 provider 读取和精确内部写入抑制，避免遗漏或重复。
+- 纯文字和 URL 在一次稳定读取后立即进入历史；只有剪贴板明确声明了尚未就绪的图片表示时，才保留后备文字并有限重试。
+- 通过稳定的 `changeCount`、最多两条有界 provider 读取 lane、迟到结果精确绑定和内部写入抑制，避免遗漏、重复或旧请求污染新内容。不可取消的同步读取采用软超时，瞬时图片保存失败最多重试两次。
 - 正常退出会确认最后一条文字或链接、等待进行中的图片保存，并刷入最新 metadata revision。
 - 默认最多保留 100 条、最长 30 天；固定项目不会被自动清理。
 
@@ -131,6 +133,7 @@ xcodebuild \
 ```text
 QuickStash/
 ├── QuickStash/                  # App 源码
+├── ClipboardReaderHelper/       # 可超时终止的剪贴板 provider 读取 helper
 ├── Tests/                       # Core、ViewModel、截图和 Hosted XCTest
 ├── Assets.xcassets/             # App 图标和资源
 ├── QuickStash.xcodeproj/        # Xcode 工程与共享 scheme
@@ -145,7 +148,7 @@ QuickStash/
 核心职责：
 
 - `QuickStashApp`：状态栏、窗口生命周期、拖放与截图互斥、异步退出。
-- `ClipboardMonitor`：剪贴板授权、稳定读取、文字/链接分类和图片保存协调。
+- `ClipboardMonitor`：剪贴板授权、稳定读取、格式回退、文字/链接分类和图片保存协调。
 - `StashViewModel`：UI 状态、revision 持久化、导入任务与恢复。
 - `QuickStashFileManager`：文件复制、删除、剪贴板图片和 orphan 恢复 I/O。
 - `StorageManager`：版本化原子 metadata 读写。
