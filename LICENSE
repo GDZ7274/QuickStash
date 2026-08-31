@@ -1,0 +1,28 @@
+QuickStash Source-Available License
+Copyright (c) 2026 GDZ. All rights reserved.
+
+中文条款
+
+1. 本仓库公开提供 QuickStash 源代码，仅允许个人查看、学习、安全审计、问题复现，以及在自己拥有或控制的设备上进行非商业评估性构建和运行。
+2. 允许在 GitHub 平台内 fork 本仓库并提交 Issue 或 Pull Request，但 fork 仅可用于上述目的或向本项目贡献修改，不得作为独立产品发布或传播。
+3. 除第 1 条和第 2 条明确允许的范围外，未经版权所有者事先书面许可，不得：
+   - 复制、发布、再分发或公开提供本软件、二进制、修改版或衍生作品；
+   - 将本软件或其任何部分用于商业、收费、组织内部生产或向第三方提供服务；
+   - 移除或误导性修改版权、许可、`QuickStash`、`GDZ` 或 `Design by GDZ` 标识；
+   - 使用 QuickStash、GDZ、应用图标或其他品牌元素暗示授权、背书或关联。
+4. 提交至本仓库的贡献必须由贡献者合法拥有或有权提交。提交 Pull Request 即表示贡献者允许版权所有者永久、全球、免版税地在 QuickStash 中使用、修改、再许可和分发该贡献。
+5. 本软件按“现状”提供，不附带任何明示或默示保证，包括但不限于适销性、特定用途适用性和不侵权保证。在法律允许的最大范围内，版权所有者不对因使用或无法使用本软件产生的任何损失承担责任。
+6. 本许可未明确授予的所有权利均由版权所有者保留。商业使用、再分发、衍生产品发布或其他授权请求必须事先取得 GDZ 的书面许可。
+
+English Terms
+
+1. The QuickStash source code is publicly visible solely for personal review, study, security auditing, issue reproduction, and non-commercial evaluation builds on devices you own or control.
+2. You may fork the repository on GitHub and submit issues or pull requests, but a fork may only be used for the purposes above or to contribute changes back to this project. It may not be published or distributed as a separate product.
+3. Except for permissions expressly granted in Sections 1 and 2, without prior written permission from the copyright holder, you may not:
+   - copy, publish, redistribute, or otherwise make available the software, binaries, modified versions, or derivative works;
+   - use any part of the software commercially, for paid services, for organizational production use, or to provide services to third parties;
+   - remove or misleadingly alter copyright, license, `QuickStash`, `GDZ`, or `Design by GDZ` notices;
+   - use the QuickStash or GDZ names, app icon, or other brand assets to imply authorization, endorsement, or affiliation.
+4. Contributors must own or otherwise have the right to submit their contributions. By submitting a pull request, a contributor grants the copyright holder a perpetual, worldwide, royalty-free right to use, modify, sublicense, and distribute that contribution as part of QuickStash.
+5. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER SHALL NOT BE LIABLE FOR ANY CLAIM OR DAMAGES ARISING FROM USE OF OR INABILITY TO USE THE SOFTWARE.
+6. All rights not expressly granted are reserved. Commercial use, redistribution, publication of derivative products, or any other license requires prior written permission from GDZ.

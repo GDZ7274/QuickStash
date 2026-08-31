@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Darwin
+import CryptoKit
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -30,6 +31,11 @@ enum ClipboardPNGEncodingError: LocalizedError, Sendable {
     }
 }
 
+struct PreparedClipboardPNG: Sendable {
+    let data: Data
+    let fingerprint: String
+}
+
 enum ClipboardPNGEncoder {
     static let maximumSourceBytes = 256 * 1_024 * 1_024
     static let maximumOutputBytes = 50 * 1_024 * 1_024
@@ -54,8 +60,19 @@ enum ClipboardPNGEncoder {
     }
 
     static func pngData(from sourceData: Data, maximumOutputBytes: Int = maximumOutputBytes) throws -> Data {
+        try prepare(from: sourceData, maximumOutputBytes: maximumOutputBytes).data
+    }
+
+    static func fingerprint(from sourceData: Data) throws -> String {
+        try prepare(from: sourceData).fingerprint
+    }
+
+    static func prepare(
+        from sourceData: Data,
+        maximumOutputBytes: Int = maximumOutputBytes
+    ) throws -> PreparedClipboardPNG {
         try autoreleasepool {
-            try encodePNG(from: sourceData, maximumOutputBytes: maximumOutputBytes)
+            try preparePNG(from: sourceData, maximumOutputBytes: maximumOutputBytes)
         }
     }
 
@@ -72,7 +89,10 @@ enum ClipboardPNGEncoder {
         }
     }
 
-    private static func encodePNG(from sourceData: Data, maximumOutputBytes: Int) throws -> Data {
+    private static func preparePNG(
+        from sourceData: Data,
+        maximumOutputBytes: Int
+    ) throws -> PreparedClipboardPNG {
         guard sourceData.count <= maximumSourceBytes else {
             throw ClipboardPNGEncodingError.sourceTooLarge
         }
@@ -124,7 +144,10 @@ enum ClipboardPNGEncoder {
             guard sourceData.count <= maximumOutputBytes else {
                 throw ClipboardPNGEncodingError.outputTooLarge
             }
-            return sourceData
+            return PreparedClipboardPNG(
+                data: sourceData,
+                fingerprint: try pixelFingerprint(decodedImage)
+            )
         }
 
         let image: CGImage?
@@ -164,7 +187,53 @@ enum ClipboardPNGEncoder {
         guard pngData.count <= maximumOutputBytes else {
             throw ClipboardPNGEncodingError.outputTooLarge
         }
-        return pngData
+        return PreparedClipboardPNG(
+            data: pngData,
+            fingerprint: try pixelFingerprint(image)
+        )
+    }
+
+    private static func pixelFingerprint(_ image: CGImage) throws -> String {
+        let width = image.width
+        let height = image.height
+        let (bytesPerRow, rowOverflow) = width.multipliedReportingOverflow(by: 4)
+        let (byteCount, sizeOverflow) = bytesPerRow.multipliedReportingOverflow(by: height)
+        guard !rowOverflow,
+              !sizeOverflow,
+              byteCount <= maximumDecodedBytes,
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+            throw ClipboardPNGEncodingError.dimensionsTooLarge
+        }
+
+        var pixels = Data(count: byteCount)
+        let rendered = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(
+                data: bytes.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+                    | CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            context.setBlendMode(.copy)
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard rendered else {
+            throw ClipboardPNGEncodingError.encodingFailed
+        }
+
+        var header = Data()
+        var bigEndianWidth = UInt64(width).bigEndian
+        var bigEndianHeight = UInt64(height).bigEndian
+        withUnsafeBytes(of: &bigEndianWidth) { header.append(contentsOf: $0) }
+        withUnsafeBytes(of: &bigEndianHeight) { header.append(contentsOf: $0) }
+        var hasher = SHA256()
+        hasher.update(data: header)
+        hasher.update(data: pixels)
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private static func decodedImage(from source: CGImageSource) -> CGImage? {
@@ -388,10 +457,48 @@ struct ImportManifestOperation: Sendable, Equatable {
     let manifestID: UUID
 }
 
+private struct ManagedFileIdentity: Codable, Sendable, Equatable {
+    let device: UInt64
+    let inode: UInt64
+}
+
+private enum DeletionSourceState: Equatable {
+    case absent
+    case matching
+    case replaced
+}
+
 private struct DeletionRecoveryManifest: Codable, Sendable {
     let id: UUID
     let originalPath: String
     let trashPath: String
+    let replacementItem: StashItem?
+    let commitOnAcknowledgement: Bool?
+    let sourceIdentity: ManagedFileIdentity?
+    let sourceWasPresent: Bool?
+
+    init(
+        id: UUID,
+        originalPath: String,
+        trashPath: String,
+        replacementItem: StashItem? = nil,
+        commitOnAcknowledgement: Bool = false,
+        sourceIdentity: ManagedFileIdentity? = nil,
+        sourceWasPresent: Bool? = nil
+    ) {
+        self.id = id
+        self.originalPath = originalPath
+        self.trashPath = trashPath
+        self.replacementItem = replacementItem
+        self.commitOnAcknowledgement = commitOnAcknowledgement
+        self.sourceIdentity = sourceIdentity
+        self.sourceWasPresent = sourceWasPresent
+    }
+}
+
+struct ManagedClipboardImageReplacement: Sendable {
+    let manifestID: UUID
+    let item: StashItem
 }
 
 struct FileImportProgress: Sendable, Equatable {
@@ -1634,12 +1741,29 @@ final class QuickStashFileManager: @unchecked Sendable {
         }
     }
 
-    func acknowledgeRecoveryManifests(_ ids: [UUID]) {
+    func acknowledgeRecoveryManifests(_ ids: [UUID]) async {
         guard !ids.isEmpty else { return }
-        ioQueue.async { [self] in
-            for id in ids {
-                removeManifest(id)
-                try? fileManager.removeItem(at: deletionManifestURL(for: id))
+        await withCheckedContinuation { continuation in
+            ioQueue.async { [self] in
+                for id in ids {
+                    removeManifest(id)
+                    let deletionURL = deletionManifestURL(for: id)
+                    guard fileManager.fileExists(atPath: deletionURL.path) else { continue }
+                    do {
+                        let data = try Data(contentsOf: deletionURL)
+                        let manifest = try JSONDecoder().decode(
+                            DeletionRecoveryManifest.self,
+                            from: data
+                        )
+                        if manifest.commitOnAcknowledgement == true {
+                            try commitDeletionManifest(manifest)
+                        }
+                        try fileManager.removeItem(at: deletionURL)
+                    } catch {
+                        // Keep the intent so the next recovery can retry cleanup.
+                    }
+                }
+                continuation.resume()
             }
         }
     }
@@ -1670,10 +1794,12 @@ final class QuickStashFileManager: @unchecked Sendable {
         var acknowledge: [UUID] = []
         var resolvedJobIDs = Set<UUID>()
         var storedRecoveryCandidates: [StashItem] = []
+        var deletionReplacementCandidates: [StashItem] = []
 
         for manifest in deletionManifests {
             let sourceURL = URL(fileURLWithPath: manifest.originalPath)
             let preferredTrashURL = URL(fileURLWithPath: manifest.trashPath)
+            let sourcePath = standardizedPath(sourceURL.path)
             guard isManagedFile(sourceURL), isDescendant(preferredTrashURL, of: trashDirectory) else {
                 cleanupFailures.append(FileCleanupFailure(
                     path: deletionManifestURL(for: manifest.id).path,
@@ -1682,21 +1808,73 @@ final class QuickStashFileManager: @unchecked Sendable {
                 needsRecovery.append(manifest.id)
                 continue
             }
-            let sourcePath = standardizedPath(sourceURL.path)
-            pathsRemovedFromMetadata.insert(sourcePath)
-            excludedOrphanPaths.insert(sourcePath)
-            if fileManager.fileExists(atPath: sourceURL.path) {
-                let destination = fileManager.fileExists(atPath: preferredTrashURL.path)
-                    ? uniqueDestination(for: sourceURL, in: trashDirectory)
-                    : preferredTrashURL
-                do {
-                    try cleanupFaultInjector?(FileCleanupOperation(
-                        kind: .committedQuarantine,
-                        sourceURL: sourceURL,
-                        destinationURL: destination
+            let sourceState: DeletionSourceState
+            do {
+                sourceState = try deletionSourceState(for: manifest)
+            } catch {
+                cleanupFailures.append(FileCleanupFailure(
+                    path: sourceURL.path,
+                    message: error.localizedDescription
+                ))
+                needsRecovery.append(manifest.id)
+                continue
+            }
+            if sourceState == .replaced {
+                acknowledge.append(manifest.id)
+                resolvedJobIDs.formUnion(importJobs.compactMap { job in
+                    job.needsRecovery && (job.recoveryManifestID == manifest.id || job.id == manifest.id)
+                        ? job.id
+                        : nil
+                })
+                continue
+            }
+            var replacementCandidate: StashItem?
+            if let replacement = manifest.replacementItem {
+                let replacementURL = URL(fileURLWithPath: replacement.content)
+                let replacementPath = standardizedPath(replacement.content)
+                excludedOrphanPaths.insert(replacementPath)
+                guard replacement.type == .image,
+                      replacement.managedOrigin == .clipboard,
+                      isDescendant(replacementURL, of: imagesDirectory),
+                      replacementPath != standardizedPath(sourceURL.path),
+                      let fingerprint = clipboardImageFingerprint(at: replacementPath),
+                      replacement.contentFingerprint.map({ $0 == fingerprint }) ?? true else {
+                    cleanupFailures.append(FileCleanupFailure(
+                        path: replacement.content,
+                        message: "图片替换恢复清单缺少有效的新文件，已保留原记录"
                     ))
-                    try fileManager.moveItem(at: sourceURL, to: destination)
+                    needsRecovery.append(manifest.id)
+                    continue
+                }
+                replacementCandidate = StashItem(
+                    id: replacement.id,
+                    type: .image,
+                    content: replacementPath,
+                    preview: replacement.preview,
+                    createdAt: replacement.createdAt,
+                    isPinned: replacement.isPinned,
+                    availability: .available,
+                    managedOrigin: .clipboard,
+                    contentFingerprint: fingerprint
+                )
+            }
+            if sourceState == .matching {
+                do {
+                    let committedState = try commitDeletionManifest(manifest)
+                    if committedState == .replaced {
+                        acknowledge.append(manifest.id)
+                        resolvedJobIDs.formUnion(importJobs.compactMap { job in
+                            job.needsRecovery && (job.recoveryManifestID == manifest.id || job.id == manifest.id)
+                                ? job.id
+                                : nil
+                        })
+                        continue
+                    }
                 } catch {
+                    if manifest.replacementItem == nil {
+                        pathsRemovedFromMetadata.insert(sourcePath)
+                        excludedOrphanPaths.insert(sourcePath)
+                    }
                     cleanupFailures.append(FileCleanupFailure(
                         path: sourceURL.path,
                         message: error.localizedDescription
@@ -1704,6 +1882,11 @@ final class QuickStashFileManager: @unchecked Sendable {
                     needsRecovery.append(manifest.id)
                     continue
                 }
+            }
+            pathsRemovedFromMetadata.insert(sourcePath)
+            excludedOrphanPaths.insert(sourcePath)
+            if let replacementCandidate {
+                deletionReplacementCandidates.append(replacementCandidate)
             }
             acknowledge.append(manifest.id)
             resolvedJobIDs.formUnion(importJobs.compactMap { job in
@@ -1728,7 +1911,7 @@ final class QuickStashFileManager: @unchecked Sendable {
                 var manifestFailures: [FileCleanupFailure] = []
                 for path in manifestPaths where fileManager.fileExists(atPath: path) {
                     let url = URL(fileURLWithPath: path)
-                    if standardizedPath(path).hasPrefix(importingDirectory.standardizedFileURL.path + "/") {
+                    if standardizedPath(path).hasPrefix(standardizedPath(importingDirectory.path) + "/") {
                         manifestFailures.append(contentsOf: cleanupStagingItem(at: url))
                     } else if isManagedFile(at: path) {
                         manifestFailures.append(contentsOf: cleanupCommittedItem(at: url))
@@ -1784,10 +1967,13 @@ final class QuickStashFileManager: @unchecked Sendable {
         }
 
         var reconciled = deduplicatedStoredItems(storedItems)
-            .filter { !pathsRemovedFromMetadata.contains(standardizedPath($0.content)) }
-        var knownPaths = Set(reconciled.map { standardizedPath($0.content) })
-        for candidate in storedRecoveryCandidates {
-            let path = standardizedPath(candidate.content)
+            .filter { item in
+                guard let path = managedPathIdentity(for: item) else { return true }
+                return !pathsRemovedFromMetadata.contains(path)
+            }
+        var knownPaths = Set(reconciled.compactMap(managedPathIdentity(for:)))
+        for candidate in deletionReplacementCandidates + storedRecoveryCandidates {
+            guard let path = managedPathIdentity(for: candidate) else { continue }
             if knownPaths.insert(path).inserted {
                 reconciled.append(candidate)
             }
@@ -1812,7 +1998,127 @@ final class QuickStashFileManager: @unchecked Sendable {
             guard item.type.isFileBacked, isManagedFile(at: item.content) else { return item }
             var updated = item
             updated.availability = fileManager.fileExists(atPath: item.content) ? .available : .unavailable
-            return updated
+            guard updated.type == .image,
+                  updated.managedOrigin == .clipboard,
+                  updated.availability == .available else {
+                return updated
+            }
+            guard let fingerprint = clipboardImageFingerprint(at: updated.content) else {
+                updated.availability = .unavailable
+                return updated
+            }
+            if let expectedFingerprint = updated.contentFingerprint {
+                if fingerprint != expectedFingerprint {
+                    updated.availability = .unavailable
+                }
+                return updated
+            }
+            return StashItem(
+                id: updated.id,
+                type: updated.type,
+                content: updated.content,
+                preview: updated.preview,
+                createdAt: updated.createdAt,
+                isPinned: updated.isPinned,
+                availability: updated.availability,
+                managedOrigin: updated.managedOrigin,
+                contentFingerprint: fingerprint
+            )
+        }
+
+        let referencedPaths = Set(storedItems.compactMap(managedPathIdentity(for:)))
+        let invalidClipboardOrphans = reconciled.filter { item in
+            item.type == .image
+                && item.managedOrigin == .clipboard
+                && item.availability == .unavailable
+                && !referencedPaths.contains(standardizedPath(item.content))
+        }
+        if !invalidClipboardOrphans.isEmpty {
+            let invalidPaths = Set(invalidClipboardOrphans.compactMap(managedPathIdentity(for:)))
+            reconciled.removeAll { item in
+                guard item.type == .image,
+                      item.managedOrigin == .clipboard,
+                      let path = managedPathIdentity(for: item) else { return false }
+                return invalidPaths.contains(path)
+            }
+            for item in invalidClipboardOrphans {
+                var manifest: DeletionRecoveryManifest?
+                do {
+                    manifest = try makeDeletionManifest(for: URL(fileURLWithPath: item.content))
+                    if let manifest {
+                        try commitDeletionManifest(manifest)
+                        acknowledge.append(manifest.id)
+                    }
+                } catch {
+                    if let manifest {
+                        needsRecovery.append(manifest.id)
+                    }
+                    cleanupFailures.append(FileCleanupFailure(
+                        path: item.content,
+                        message: error.localizedDescription
+                    ))
+                }
+            }
+        }
+
+        let persistedIDs = Set(storedItems.map(\.id))
+        let fingerprintGroups = Dictionary(grouping: reconciled.filter { item in
+            item.type == .image
+                && item.managedOrigin == .clipboard
+                && item.contentFingerprint != nil
+        }) { $0.contentFingerprint! }
+        for fingerprint in fingerprintGroups.keys.sorted() {
+            guard let group = fingerprintGroups[fingerprint],
+                  group.count > 1,
+                  group.contains(where: { $0.availability == .available }) else { continue }
+            let ordered = group.sorted { lhs, rhs in
+                let lhsPersisted = persistedIDs.contains(lhs.id)
+                let rhsPersisted = persistedIDs.contains(rhs.id)
+                if lhsPersisted != rhsPersisted { return lhsPersisted }
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+            guard let canonical = ordered.first,
+                  let backing = ordered.first(where: { $0.availability == .available }) else { continue }
+            let groupIDs = Set(group.map(\.id))
+            let groupPaths = Set(group.map { standardizedPath($0.content) })
+            let backingPath = standardizedPath(backing.content)
+            let merged = StashItem(
+                id: canonical.id,
+                type: .image,
+                content: backingPath,
+                preview: backing.preview,
+                createdAt: group.map(\.createdAt).max() ?? canonical.createdAt,
+                isPinned: group.contains(where: \.isPinned),
+                availability: .available,
+                managedOrigin: .clipboard,
+                contentFingerprint: fingerprint
+            )
+            reconciled.removeAll { item in
+                guard item.type == .image,
+                      item.managedOrigin == .clipboard else { return false }
+                return groupIDs.contains(item.id)
+                    || managedPathIdentity(for: item).map(groupPaths.contains) == true
+            }
+            reconciled.append(merged)
+
+            for duplicate in group where standardizedPath(duplicate.content) != backingPath {
+                do {
+                    let manifest = try makeDeletionManifest(
+                        for: URL(fileURLWithPath: duplicate.content),
+                        replacementItem: merged,
+                        commitOnAcknowledgement: true
+                    )
+                    if let manifest {
+                        acknowledge.append(manifest.id)
+                    }
+                } catch {
+                    cleanupFailures.append(FileCleanupFailure(
+                        path: duplicate.content,
+                        message: error.localizedDescription
+                    ))
+                }
+            }
         }
         reconciled.sort { $0.createdAt > $1.createdAt }
         return ManagedFileRecoveryResult(
@@ -1832,13 +2138,35 @@ final class QuickStashFileManager: @unchecked Sendable {
         let detail = isDirectory
             ? "文件夹"
             : ByteCountFormatter.string(fromByteCount: Int64(values?.fileSize ?? 0), countStyle: .file)
+        let fingerprint = origin == .clipboard && type == .image
+            ? clipboardImageFingerprint(at: url.path)
+            : nil
         return StashItem(
             type: type,
-            content: url.path,
+            content: standardizedPath(url.path),
             preview: "\(url.lastPathComponent) (\(detail))",
             createdAt: values?.contentModificationDate ?? Date(),
-            managedOrigin: origin
+            managedOrigin: origin,
+            contentFingerprint: fingerprint
         )
+    }
+
+    private func clipboardImageFingerprint(at path: String) -> String? {
+        let url = URL(fileURLWithPath: path)
+        guard isDescendant(url, of: imagesDirectory),
+              fileManager.fileExists(atPath: url.path),
+              let values = try? url.resourceValues(forKeys: [
+                  .isRegularFileKey,
+                  .isSymbolicLinkKey,
+                  .fileSizeKey
+              ]),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              (values.fileSize ?? 0) <= ClipboardPNGEncoder.maximumSourceBytes,
+              let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else {
+            return nil
+        }
+        return try? ClipboardPNGEncoder.fingerprint(from: data)
     }
 
     private func deduplicatedStoredItems(_ items: [StashItem]) -> [StashItem] {
@@ -1865,8 +2193,16 @@ final class QuickStashFileManager: @unchecked Sendable {
         return result
     }
 
+    private func managedPathIdentity(for item: StashItem) -> String? {
+        guard item.type.isFileBacked, isManagedFile(at: item.content) else { return nil }
+        return standardizedPath(item.content)
+    }
+
     private func standardizedPath(_ path: String) -> String {
-        URL(fileURLWithPath: path).standardizedFileURL.path
+        URL(fileURLWithPath: path)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
     }
 
     private func manifestURL(for id: UUID) -> URL {
@@ -1917,6 +2253,90 @@ final class QuickStashFileManager: @unchecked Sendable {
 
     private func writeDeletionManifest(_ manifest: DeletionRecoveryManifest) throws {
         try JSONEncoder().encode(manifest).write(to: deletionManifestURL(for: manifest.id), options: [.atomic])
+    }
+
+    private func makeDeletionManifest(
+        for sourceURL: URL,
+        replacementItem: StashItem? = nil,
+        commitOnAcknowledgement: Bool = false
+    ) throws -> DeletionRecoveryManifest? {
+        guard isManagedFile(sourceURL) else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        let sourceWasPresent = fileManager.fileExists(atPath: sourceURL.path)
+        guard sourceWasPresent || replacementItem != nil else {
+            return nil
+        }
+        let sourceIdentity = sourceWasPresent ? try managedFileIdentity(at: sourceURL) : nil
+        let manifest = DeletionRecoveryManifest(
+            id: UUID(),
+            originalPath: standardizedPath(sourceURL.path),
+            trashPath: trashDirectory.appendingPathComponent(
+                "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)-\(sourceURL.lastPathComponent)"
+            ).path,
+            replacementItem: replacementItem,
+            commitOnAcknowledgement: commitOnAcknowledgement,
+            sourceIdentity: sourceIdentity,
+            sourceWasPresent: sourceWasPresent
+        )
+        try writeDeletionManifest(manifest)
+        return manifest
+    }
+
+    private func deletionSourceState(
+        for manifest: DeletionRecoveryManifest
+    ) throws -> DeletionSourceState {
+        let sourceURL = URL(fileURLWithPath: manifest.originalPath)
+        let preferredTrashURL = URL(fileURLWithPath: manifest.trashPath)
+        guard isManagedFile(sourceURL), isDescendant(preferredTrashURL, of: trashDirectory) else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        guard fileManager.fileExists(atPath: sourceURL.path) else { return .absent }
+        if manifest.sourceWasPresent == false {
+            return .replaced
+        }
+        if let expectedIdentity = manifest.sourceIdentity {
+            return try managedFileIdentity(at: sourceURL) == expectedIdentity
+                ? .matching
+                : .replaced
+        }
+        if manifest.sourceWasPresent == nil,
+           fileManager.fileExists(atPath: preferredTrashURL.path) {
+            return .replaced
+        }
+        return .matching
+    }
+
+    @discardableResult
+    private func commitDeletionManifest(
+        _ manifest: DeletionRecoveryManifest
+    ) throws -> DeletionSourceState {
+        let state = try deletionSourceState(for: manifest)
+        guard state == .matching else { return state }
+        let sourceURL = URL(fileURLWithPath: manifest.originalPath)
+        let preferredTrashURL = URL(fileURLWithPath: manifest.trashPath)
+        let destination = fileManager.fileExists(atPath: preferredTrashURL.path)
+            ? uniqueDestination(for: sourceURL, in: trashDirectory)
+            : preferredTrashURL
+        try cleanupFaultInjector?(FileCleanupOperation(
+            kind: .committedQuarantine,
+            sourceURL: sourceURL,
+            destinationURL: destination
+        ))
+        try fileManager.moveItem(at: sourceURL, to: destination)
+        return .absent
+    }
+
+    private func managedFileIdentity(at url: URL) throws -> ManagedFileIdentity {
+        var status = stat()
+        guard lstat(url.path, &status) == 0 else {
+            let code = POSIXErrorCode(rawValue: errno) ?? .EIO
+            throw POSIXError(code)
+        }
+        return ManagedFileIdentity(
+            device: UInt64(bitPattern: Int64(status.st_dev)),
+            inode: UInt64(status.st_ino)
+        )
     }
 
     private func updateManifestThrowing(
@@ -1994,19 +2414,44 @@ final class QuickStashFileManager: @unchecked Sendable {
             ioQueue.async { [self] in
                 do {
                     try ensureDirectories()
-                    let pngData = try ClipboardPNGEncoder.pngData(from: data)
+                    let prepared = try ClipboardPNGEncoder.prepare(from: data)
                     let fileURL = imagesDirectory
                         .appendingPathComponent(UUID().uuidString)
                         .appendingPathExtension("png")
-                    try pngData.write(to: fileURL, options: .atomic)
-                    let size = ByteCountFormatter.string(fromByteCount: Int64(pngData.count), countStyle: .file)
+                    try prepared.data.write(to: fileURL, options: .atomic)
+                    do {
+                        try fileManager.setAttributes(
+                            [.modificationDate: createdAt],
+                            ofItemAtPath: fileURL.path
+                        )
+                    } catch {
+                        try? fileManager.removeItem(at: fileURL)
+                        throw error
+                    }
+                    let size = ByteCountFormatter.string(
+                        fromByteCount: Int64(prepared.data.count),
+                        countStyle: .file
+                    )
                     continuation.resume(returning: StashItem(
                         type: .image,
-                        content: fileURL.path,
+                        content: standardizedPath(fileURL.path),
                         preview: "图片 (\(size))",
                         createdAt: createdAt,
-                        managedOrigin: .clipboard
+                        managedOrigin: .clipboard,
+                        contentFingerprint: prepared.fingerprint
                     ))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    func clipboardImageFingerprint(data: Data) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            ioQueue.async {
+                do {
+                    continuation.resume(returning: try ClipboardPNGEncoder.fingerprint(from: data))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -2017,12 +2462,25 @@ final class QuickStashFileManager: @unchecked Sendable {
     func discardUnregisteredClipboardImage(at path: String) async {
         await withCheckedContinuation { continuation in
             ioQueue.async { [self] in
-                let url = URL(fileURLWithPath: path)
-                guard isDescendant(url, of: imagesDirectory) else {
-                    continuation.resume()
-                    return
+                do {
+                    try ensureDirectories()
+                    let sourceURL = URL(fileURLWithPath: path)
+                    guard isDescendant(sourceURL, of: imagesDirectory) else {
+                        continuation.resume()
+                        return
+                    }
+                    if let manifest = try makeDeletionManifest(for: sourceURL) {
+                        let result = try commitDeletionManifest(manifest)
+                        guard result != .replaced else {
+                            try? fileManager.removeItem(at: deletionManifestURL(for: manifest.id))
+                            continuation.resume()
+                            return
+                        }
+                        try? fileManager.removeItem(at: deletionManifestURL(for: manifest.id))
+                    }
+                } catch {
+                    // A written manifest is intentionally retained so recovery can finish the discard.
                 }
-                try? fileManager.removeItem(at: url)
                 continuation.resume()
             }
         }
@@ -2056,35 +2514,91 @@ final class QuickStashFileManager: @unchecked Sendable {
                 do {
                     try ensureDirectories()
                     let sourceURL = URL(fileURLWithPath: path)
-                    guard isManagedFile(sourceURL) else {
-                        throw CocoaError(.fileWriteNoPermission)
-                    }
-                    guard fileManager.fileExists(atPath: sourceURL.path) else {
+                    guard let manifest = try makeDeletionManifest(for: sourceURL) else {
                         continuation.resume(returning: nil)
                         return
                     }
-
-                    let manifestID = UUID()
-                    let destination = trashDirectory.appendingPathComponent(
-                        "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString)-\(sourceURL.lastPathComponent)"
-                    )
-                    try cleanupFaultInjector?(FileCleanupOperation(
-                        kind: .committedQuarantine,
-                        sourceURL: sourceURL,
-                        destinationURL: destination
-                    ))
-                    try writeDeletionManifest(DeletionRecoveryManifest(
-                        id: manifestID,
-                        originalPath: sourceURL.path,
-                        trashPath: destination.path
-                    ))
                     do {
-                        try fileManager.moveItem(at: sourceURL, to: destination)
+                        guard try commitDeletionManifest(manifest) != .replaced else {
+                            throw CocoaError(.fileWriteFileExists)
+                        }
                     } catch {
-                        try? fileManager.removeItem(at: deletionManifestURL(for: manifestID))
+                        try? fileManager.removeItem(at: deletionManifestURL(for: manifest.id))
                         throw error
                     }
-                    continuation.resume(returning: manifestID)
+                    continuation.resume(returning: manifest.id)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    func prepareClipboardImageReplacement(
+        existing: StashItem,
+        incoming: StashItem
+    ) async throws -> ManagedClipboardImageReplacement {
+        try await withCheckedThrowingContinuation { continuation in
+            ioQueue.async { [self] in
+                do {
+                    try ensureDirectories()
+                    let sourceURL = URL(fileURLWithPath: existing.content)
+                    let incomingURL = URL(fileURLWithPath: incoming.content)
+                    guard existing.type == .image,
+                          incoming.type == .image,
+                          existing.managedOrigin == .clipboard,
+                          incoming.managedOrigin == .clipboard,
+                          isDescendant(sourceURL, of: imagesDirectory),
+                          isDescendant(incomingURL, of: imagesDirectory),
+                          standardizedPath(sourceURL.path) != standardizedPath(incomingURL.path),
+                          let fingerprint = clipboardImageFingerprint(at: incomingURL.path),
+                          existing.contentFingerprint.map({ $0 == fingerprint }) ?? true,
+                          incoming.contentFingerprint.map({ $0 == fingerprint }) ?? true else {
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
+                    let replacement = StashItem(
+                        id: existing.id,
+                        type: .image,
+                        content: standardizedPath(incomingURL.path),
+                        preview: incoming.preview,
+                        createdAt: max(existing.createdAt, incoming.createdAt),
+                        isPinned: existing.isPinned,
+                        availability: .available,
+                        managedOrigin: .clipboard,
+                        contentFingerprint: fingerprint
+                    )
+                    guard let manifest = try makeDeletionManifest(
+                        for: sourceURL,
+                        replacementItem: replacement
+                    ) else {
+                        throw CocoaError(.fileWriteUnknown)
+                    }
+                    continuation.resume(returning: ManagedClipboardImageReplacement(
+                        manifestID: manifest.id,
+                        item: replacement
+                    ))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    func commitPreparedDeletion(manifestID: UUID) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            ioQueue.async { [self] in
+                do {
+                    guard let data = try? Data(contentsOf: deletionManifestURL(for: manifestID)),
+                          let manifest = try? JSONDecoder().decode(
+                              DeletionRecoveryManifest.self,
+                              from: data
+                          ) else {
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
+                    guard try commitDeletionManifest(manifest) != .replaced else {
+                        throw CocoaError(.fileWriteFileExists)
+                    }
+                    continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -2108,6 +2622,34 @@ final class QuickStashFileManager: @unchecked Sendable {
         await withCheckedContinuation { continuation in
             ioQueue.async { [self] in
                 continuation.resume(returning: isManagedFile(at: path))
+            }
+        }
+    }
+
+    func isReusableClipboardImage(
+        at path: String,
+        matching expectedFingerprint: String
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            ioQueue.async { [self] in
+                let url = URL(fileURLWithPath: path)
+                guard isDescendant(url, of: imagesDirectory),
+                      fileManager.isReadableFile(atPath: url.path),
+                      let values = try? url.resourceValues(forKeys: [
+                          .isRegularFileKey,
+                          .isSymbolicLinkKey,
+                          .fileSizeKey
+                      ]),
+                      values.isRegularFile == true,
+                      values.isSymbolicLink != true,
+                      (values.fileSize ?? 0) <= ClipboardPNGEncoder.maximumSourceBytes,
+                      let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+                      let fingerprint = try? ClipboardPNGEncoder.fingerprint(from: data),
+                      fingerprint == expectedFingerprint else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                continuation.resume(returning: true)
             }
         }
     }

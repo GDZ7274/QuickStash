@@ -166,8 +166,10 @@ final class QuickStashScreenshotXCTests: XCTestCase {
 
         monitor.setConsent(.disabled)
         let prepared = try await monitor.prepareImageRecord(data: Data([1, 2, 3]))
-        XCTAssertTrue(monitor.commitPreparedImageRecord(prepared))
-        XCTAssertFalse(monitor.commitPreparedImageRecord(prepared))
+        let preparedDidCommit = await monitor.commitPreparedImageRecord(prepared)
+        let preparedDidCommitAgain = await monitor.commitPreparedImageRecord(prepared)
+        XCTAssertTrue(preparedDidCommit)
+        XCTAssertFalse(preparedDidCommitAgain)
 
         XCTAssertEqual(received.map(\.type), [.text, .url, .image])
         XCTAssertTrue(received.allSatisfy { $0.managedOrigin == .clipboard })

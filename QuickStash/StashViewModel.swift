@@ -6,6 +6,9 @@ typealias StashImportHandler = @Sendable (
     ImportCancellationToken,
     @escaping @Sendable (FileImportProgress) -> Void
 ) async -> FileImportBatch
+typealias ClipboardTextWriter = @MainActor (String) -> Bool
+typealias ClipboardImageReader = @Sendable (String) async throws -> ClipboardImagePayload
+typealias ClipboardImageWriter = @MainActor (ClipboardImagePayload) -> Bool
 
 @MainActor
 protocol ClipboardRetentionScheduling: AnyObject {
@@ -39,6 +42,11 @@ private enum BootstrapMutation {
     case addImported([StashItem])
 }
 
+private struct PendingClipboardImageReplacement {
+    let existing: StashItem
+    let incoming: StashItem
+}
+
 @MainActor
 final class StashViewModel: ObservableObject {
     static let shared = StashViewModel(
@@ -67,6 +75,7 @@ final class StashViewModel: ObservableObject {
     private var isBootstrapping = false
     private var bootstrapGeneration = UUID()
     private var bootstrapMutations: [BootstrapMutation] = []
+    private var bootstrapItemIDAliases: [UUID: UUID] = [:]
     private var revision: Int64 = 0
     private var persistedRevision: Int64 = 0
     private var pendingManifestAcknowledgements: [UUID: Int64] = [:]
@@ -85,7 +94,21 @@ final class StashViewModel: ObservableObject {
     private let clipboardCleanupRetryDelay: TimeInterval
     private var pendingClipboardCleanupIDs = Set<UUID>()
     private var clipboardCleanupRetryAfter: [UUID: Date] = [:]
+    private var pendingItemDeletionIDs = Set<UUID>()
+    private var itemDeletionTasks: [UUID: Task<Void, Never>] = [:]
+    private var clipboardCopyGeneration: UInt64 = 0
+    private var pendingClipboardCopyCounts: [UUID: Int] = [:]
+    private var clipboardImageCopyTasks: [UUID: Task<Void, Never>] = [:]
+    private var clipboardImageDiscardTasks: [UUID: Task<Void, Never>] = [:]
+    private var manifestAcknowledgementTasks: [UUID: Task<Void, Never>] = [:]
+    private var clipboardCleanupTasks: [UUID: Task<ClipboardClearResult, Never>] = [:]
+    private var pendingImageReplacementIDs = Set<UUID>()
+    private var pendingClipboardImageReplacements: [String: PendingClipboardImageReplacement] = [:]
+    private var isFlushingForTermination = false
     private var retentionObservers: [NSObjectProtocol] = []
+    private let clipboardTextWriter: ClipboardTextWriter
+    private let clipboardImageReader: ClipboardImageReader
+    private let clipboardImageWriter: ClipboardImageWriter
 
     var importingFileCount: Int {
         importJobs
@@ -96,6 +119,8 @@ final class StashViewModel: ObservableObject {
     var visibleImportJobs: [ImportJob] {
         ImportJobPresentation.visibleJobs(from: importJobs)
     }
+
+    var isTerminationFlushActive: Bool { isFlushingForTermination }
 
     init(
         storageManager: StorageManager = .shared,
@@ -108,7 +133,10 @@ final class StashViewModel: ObservableObject {
         clipboardCaptureInvalidator: (@MainActor () -> Void)? = nil,
         clipboardCleanupRetryDelay: TimeInterval = 60,
         observeSystemTimeChanges: Bool = false,
-        importHandler: StashImportHandler? = nil
+        importHandler: StashImportHandler? = nil,
+        clipboardTextWriter: ClipboardTextWriter? = nil,
+        clipboardImageReader: ClipboardImageReader? = nil,
+        clipboardImageWriter: ClipboardImageWriter? = nil
     ) {
         self.storageManager = storageManager
         self.fileManager = fileManager
@@ -121,6 +149,23 @@ final class StashViewModel: ObservableObject {
         self.clipboardCleanupRetryDelay = max(1, clipboardCleanupRetryDelay)
         self.importHandler = importHandler ?? { urls, token, progress in
             await fileManager.importFiles(urls, cancellationToken: token, progress: progress)
+        }
+        self.clipboardTextWriter = clipboardTextWriter ?? { content in
+            ClipboardMonitor.shared.performInternalWrite {
+                let changeCount = NSPasteboard.general.clearContents()
+                let result = NSPasteboard.general.setString(content, forType: .string)
+                return (result, changeCount)
+            }
+        }
+        self.clipboardImageReader = clipboardImageReader ?? { path in
+            try await fileManager.readManagedImage(at: path)
+        }
+        self.clipboardImageWriter = clipboardImageWriter ?? { payload in
+            ClipboardMonitor.shared.performInternalWrite {
+                let changeCount = NSPasteboard.general.clearContents()
+                let result = NSPasteboard.general.setData(payload.data, forType: payload.pasteboardType)
+                return (result, changeCount)
+            }
         }
         if loadOnInit {
             isBootstrapping = true
@@ -154,7 +199,7 @@ final class StashViewModel: ObservableObject {
     }
 
     func loadItems() {
-        guard !isBootstrapping else { return }
+        guard !isBootstrapping, !isFlushingForTermination else { return }
         isBootstrapping = true
         bootstrapGeneration = UUID()
         let generation = bootstrapGeneration
@@ -185,6 +230,14 @@ final class StashViewModel: ObservableObject {
     }
 
     func flushForTermination() async {
+        isFlushingForTermination = true
+        clipboardRetentionScheduler.cancel()
+        importCancellationTokens.values.forEach { $0.cancel() }
+        await cancelAndDrainClipboardImageCopies()
+        await drainItemDeletions()
+        await drainClipboardCleanupTasks()
+        await drainClipboardImageDiscards()
+        await drainManifestAcknowledgements()
         if isBootstrapping {
             guard !bootstrapMutations.isEmpty
                     || !importJobs.isEmpty
@@ -194,6 +247,8 @@ final class StashViewModel: ObservableObject {
                 } catch {
                     lastError = "保存失败：\(error.localizedDescription)"
                 }
+                schedulePendingRegisteredImageCleanups()
+                await drainClipboardImageDiscards()
                 return
             }
             await finishBootstrapForTermination()
@@ -213,6 +268,75 @@ final class StashViewModel: ObservableObject {
             } catch {
                 lastError = "保存失败：\(error.localizedDescription)"
                 return
+            }
+        }
+        schedulePendingRegisteredImageCleanups()
+        await drainClipboardImageDiscards()
+        await drainItemDeletions()
+        await drainClipboardCleanupTasks()
+        await drainManifestAcknowledgements()
+        while revision > persistedRevision {
+            let targetRevision = revision
+            let snapshot = StorageSnapshot(
+                revision: targetRevision,
+                items: items,
+                importJobs: importJobs
+            )
+            do {
+                try await storageManager.flush(snapshot)
+                persistedRevision = max(persistedRevision, targetRevision)
+                acknowledgeManifests(persistedThrough: targetRevision)
+            } catch {
+                lastError = "保存失败：\(error.localizedDescription)"
+                return
+            }
+        }
+        await drainManifestAcknowledgements()
+    }
+
+    private func cancelAndDrainClipboardImageCopies() async {
+        clipboardCopyGeneration &+= 1
+        while !clipboardImageCopyTasks.isEmpty {
+            let tasks = Array(clipboardImageCopyTasks.values)
+            tasks.forEach { $0.cancel() }
+            for task in tasks {
+                await task.value
+            }
+        }
+    }
+
+    private func drainClipboardImageDiscards() async {
+        while !clipboardImageDiscardTasks.isEmpty {
+            let tasks = Array(clipboardImageDiscardTasks.values)
+            for task in tasks {
+                await task.value
+            }
+        }
+    }
+
+    private func drainItemDeletions() async {
+        while !itemDeletionTasks.isEmpty {
+            let tasks = Array(itemDeletionTasks.values)
+            for task in tasks {
+                await task.value
+            }
+        }
+    }
+
+    private func drainManifestAcknowledgements() async {
+        while !manifestAcknowledgementTasks.isEmpty {
+            let tasks = Array(manifestAcknowledgementTasks.values)
+            for task in tasks {
+                await task.value
+            }
+        }
+    }
+
+    private func drainClipboardCleanupTasks() async {
+        while !clipboardCleanupTasks.isEmpty {
+            let tasks = Array(clipboardCleanupTasks.values)
+            for task in tasks {
+                _ = await task.value
             }
         }
     }
@@ -253,6 +377,10 @@ final class StashViewModel: ObservableObject {
         guard generation == bootstrapGeneration else { return }
 
         var mergedItems = recovery.items
+        removeRecoveredCopiesOfBootstrapInputs(
+            from: &mergedItems,
+            persistedItems: loadedSnapshot.items
+        )
         var mergedJobs = normalizeLoadedJobs(loadedSnapshot.importJobs)
             .filter { !recovery.resolvedJobIDs.contains($0.id) }
         replayBootstrapMutations(
@@ -281,6 +409,7 @@ final class StashViewModel: ObservableObject {
         }
         isBootstrapping = false
         saveSnapshot(revision: revision)
+        schedulePendingRegisteredImageCleanups()
         applyClipboardRetentionPolicy()
 
         if let cleanupFailure = recovery.cleanupFailures.first {
@@ -349,16 +478,20 @@ final class StashViewModel: ObservableObject {
         for mutation in bootstrapMutations {
             switch mutation {
             case .add(let item):
-                add(item, to: &targetItems)
+                let canonicalID = add(item, to: &targetItems)
+                registerBootstrapItemAlias(from: item.id, to: canonicalID)
             case .delete(let id):
-                targetItems.removeAll { $0.id == id }
+                let resolvedID = resolvedBootstrapItemID(id)
+                targetItems.removeAll { $0.id == resolvedID }
             case .togglePin(let id):
-                if let index = targetItems.firstIndex(where: { $0.id == id }) {
+                let resolvedID = resolvedBootstrapItemID(id)
+                if let index = targetItems.firstIndex(where: { $0.id == resolvedID }) {
                     targetItems[index].isPinned.toggle()
                 }
             case .addImported(let imported):
                 for item in imported.reversed() {
-                    add(item, to: &targetItems)
+                    let canonicalID = add(item, to: &targetItems)
+                    registerBootstrapItemAlias(from: item.id, to: canonicalID)
                 }
             }
         }
@@ -372,6 +505,102 @@ final class StashViewModel: ObservableObject {
         }
     }
 
+    private func registerBootstrapItemAlias(from incomingID: UUID, to canonicalID: UUID) {
+        let resolvedCanonicalID = resolvedBootstrapItemID(canonicalID)
+        guard incomingID != resolvedCanonicalID else { return }
+
+        bootstrapItemIDAliases[incomingID] = resolvedCanonicalID
+        let aliasesToFlatten = bootstrapItemIDAliases.compactMap { sourceID, destinationID in
+            destinationID == incomingID ? sourceID : nil
+        }
+        for sourceID in aliasesToFlatten {
+            bootstrapItemIDAliases[sourceID] = resolvedCanonicalID
+        }
+
+        if let incomingCount = pendingClipboardCopyCounts.removeValue(forKey: incomingID) {
+            pendingClipboardCopyCounts[resolvedCanonicalID, default: 0] += incomingCount
+        }
+        if pendingClipboardCleanupIDs.remove(incomingID) != nil {
+            pendingClipboardCleanupIDs.insert(resolvedCanonicalID)
+        }
+        if pendingItemDeletionIDs.remove(incomingID) != nil {
+            pendingItemDeletionIDs.insert(resolvedCanonicalID)
+        }
+        if let incomingRetry = clipboardCleanupRetryAfter.removeValue(forKey: incomingID) {
+            clipboardCleanupRetryAfter[resolvedCanonicalID] = max(
+                clipboardCleanupRetryAfter[resolvedCanonicalID] ?? .distantPast,
+                incomingRetry
+            )
+        }
+    }
+
+    private func resolvedBootstrapItemID(_ id: UUID) -> UUID {
+        var resolvedID = id
+        var visited = Set<UUID>()
+        while visited.insert(resolvedID).inserted,
+              let nextID = bootstrapItemIDAliases[resolvedID],
+              nextID != resolvedID {
+            resolvedID = nextID
+        }
+        return resolvedID
+    }
+
+    private func currentItem(
+        matching item: StashItem,
+        allowEquivalentBootstrapImageBacking: Bool = false
+    ) -> StashItem? {
+        let resolvedID = resolvedBootstrapItemID(item.id)
+        return items.first { current in
+            guard current.id == resolvedID,
+                  current.type == item.type,
+                  current.managedOrigin == item.managedOrigin else { return false }
+            if current.content == item.content { return true }
+            guard allowEquivalentBootstrapImageBacking,
+                  resolvedID != item.id,
+                  item.type == .image,
+                  item.managedOrigin == .clipboard,
+                  let fingerprint = item.contentFingerprint else { return false }
+            return current.contentFingerprint == fingerprint
+        }
+    }
+
+    private func removeRecoveredCopiesOfBootstrapInputs(
+        from targetItems: inout [StashItem],
+        persistedItems: [StashItem]
+    ) {
+        let persistedIDs = Set(persistedItems.map(\.id))
+        let pathIdentity: (String) -> String = { path in
+            URL(fileURLWithPath: path).standardizedFileURL.path
+        }
+        let persistedPaths = Set(persistedItems.compactMap { item in
+            item.type.isFileBacked
+                ? pathIdentity(item.content)
+                : nil
+        })
+        let replayPaths = Set(bootstrapMutations.flatMap { mutation -> [String] in
+            let addedItems: [StashItem]
+            switch mutation {
+            case .add(let item):
+                addedItems = [item]
+            case .addImported(let items):
+                addedItems = items
+            case .delete, .togglePin:
+                addedItems = []
+            }
+            return addedItems.compactMap { item in
+                item.type.isFileBacked
+                    ? pathIdentity(item.content)
+                    : nil
+            }
+        })
+        let recoveredOnlyReplayPaths = replayPaths.subtracting(persistedPaths)
+        guard !recoveredOnlyReplayPaths.isEmpty else { return }
+        targetItems.removeAll { item in
+            !persistedIDs.contains(item.id)
+                && recoveredOnlyReplayPaths.contains(pathIdentity(item.content))
+        }
+    }
+
     private func acknowledgeManifests(persistedThrough revision: Int64) {
         let ids = pendingManifestAcknowledgements.compactMap { id, requiredRevision in
             requiredRevision <= revision ? id : nil
@@ -380,7 +609,13 @@ final class StashViewModel: ObservableObject {
         for id in ids {
             pendingManifestAcknowledgements[id] = nil
         }
-        fileManager.acknowledgeRecoveryManifests(ids)
+        let taskID = UUID()
+        let manager = fileManager
+        let task = Task { [weak self] in
+            await manager.acknowledgeRecoveryManifests(ids)
+            self?.manifestAcknowledgementTasks[taskID] = nil
+        }
+        manifestAcknowledgementTasks[taskID] = task
     }
 
     func filteredGroups(searchText: String, groupMode: GroupMode, typeFilter: ItemType? = nil) -> [DailyGroup] {
@@ -473,55 +708,399 @@ final class StashViewModel: ObservableObject {
     }
 
     func copyToClipboard(_ item: StashItem) {
-        if item.type == .image {
-            Task {
+        guard !isFlushingForTermination else { return }
+        guard let current = currentItem(
+            matching: item,
+            allowEquivalentBootstrapImageBacking: true
+        ),
+        !pendingClipboardCleanupIDs.contains(current.id),
+        !pendingItemDeletionIDs.contains(current.id),
+        !pendingImageReplacementIDs.contains(current.id) else {
+            lastError = "该记录正在清理或已失效，暂时无法复制"
+            return
+        }
+        clipboardCopyGeneration &+= 1
+        let copyGeneration = clipboardCopyGeneration
+        clipboardImageCopyTasks.values.forEach { $0.cancel() }
+        if current.type == .image {
+            guard claimClipboardCopy(current) else { return }
+            let taskID = UUID()
+            let imageReader = clipboardImageReader
+            let task = Task { [weak self] in
+                defer {
+                    self?.finishClipboardCopy(current)
+                    self?.clipboardImageCopyTasks[taskID] = nil
+                }
                 do {
-                    let payload = try await fileManager.readManagedImage(at: item.content)
-                    ClipboardMonitor.shared.performInternalWrite {
-                        let changeCount = NSPasteboard.general.clearContents()
-                        let result = NSPasteboard.general.setData(
-                            payload.data,
-                            forType: payload.pasteboardType
-                        )
-                        return (result, changeCount)
+                    let payload = try await imageReader(current.content)
+                    guard let self,
+                          !Task.isCancelled,
+                          copyGeneration == self.clipboardCopyGeneration,
+                          self.clipboardCopyIsCurrent(current) else { return }
+                    guard self.clipboardImageWriter(payload) else {
+                        self.lastError = "复制图片失败：无法写入系统剪贴板"
+                        return
                     }
+                    self.promoteClipboardItem(id: current.id, at: Date())
                 } catch {
-                    lastError = "复制图片失败：\(error.localizedDescription)"
+                    guard let self,
+                          !Task.isCancelled,
+                          copyGeneration == self.clipboardCopyGeneration else { return }
+                    self.lastError = "复制图片失败：\(error.localizedDescription)"
                 }
             }
+            clipboardImageCopyTasks[taskID] = task
             return
         }
 
-        ClipboardMonitor.shared.performInternalWrite {
-            let changeCount = NSPasteboard.general.clearContents()
-            let result = NSPasteboard.general.setString(item.content, forType: .string)
-            return (result, changeCount)
+        guard clipboardTextWriter(current.content) else {
+            lastError = "复制失败：无法写入系统剪贴板"
+            return
         }
+        guard copyGeneration == clipboardCopyGeneration else { return }
+        promoteClipboardItem(id: current.id, at: Date())
+    }
+
+    private func claimClipboardCopy(_ item: StashItem) -> Bool {
+        let resolvedID = resolvedBootstrapItemID(item.id)
+        guard currentItem(matching: item, allowEquivalentBootstrapImageBacking: true) != nil,
+              !pendingClipboardCleanupIDs.contains(resolvedID),
+              !pendingItemDeletionIDs.contains(resolvedID),
+              !pendingImageReplacementIDs.contains(resolvedID) else {
+            lastError = "该记录正在清理或已失效，暂时无法复制"
+            return false
+        }
+        pendingClipboardCopyCounts[resolvedID, default: 0] += 1
+        rescheduleClipboardRetention(now: retentionNowProvider())
+        return true
+    }
+
+    private func clipboardCopyIsCurrent(_ item: StashItem) -> Bool {
+        let resolvedID = resolvedBootstrapItemID(item.id)
+        return (pendingClipboardCopyCounts[resolvedID] ?? 0) > 0
+            && !pendingClipboardCleanupIDs.contains(resolvedID)
+            && !pendingItemDeletionIDs.contains(resolvedID)
+            && currentItem(matching: item, allowEquivalentBootstrapImageBacking: true) != nil
+    }
+
+    private func finishClipboardCopy(_ item: StashItem) {
+        let resolvedID = resolvedBootstrapItemID(item.id)
+        let remaining = max(0, (pendingClipboardCopyCounts[resolvedID] ?? 1) - 1)
+        if remaining == 0 {
+            pendingClipboardCopyCounts[resolvedID] = nil
+        } else {
+            pendingClipboardCopyCounts[resolvedID] = remaining
+        }
+        guard !isFlushingForTermination else { return }
+        applyClipboardRetentionPolicy()
     }
 
     func addItem(_ item: StashItem) {
+        guard !isFlushingForTermination else { return }
         if isBootstrapping {
             bootstrapMutations.append(.add(item))
         }
         add(item, to: &items)
+        if !isBootstrapping {
+            schedulePendingRegisteredImageCleanups()
+        }
         if item.managedOrigin == .clipboard {
             applyClipboardRetentionPolicy()
         }
     }
 
-    private func add(_ item: StashItem, to target: inout [StashItem]) {
-        if let index = target.firstIndex(where: {
-            $0.type == item.type
-                && $0.managedOrigin == item.managedOrigin
-                && $0.content == item.content
-        }) {
+    @discardableResult
+    private func add(_ item: StashItem, to target: inout [StashItem]) -> UUID {
+        if let index = clipboardDuplicateIndex(for: item, in: target) {
             let existing = target.remove(at: index)
-            var refreshed = item
-            refreshed.isPinned = existing.isPinned
+            let refreshed = refreshedDuplicate(existing: existing, incoming: item)
+            if item.type == .image,
+               refreshed.content == item.content,
+               refreshed.content != existing.content {
+                queueClipboardImageReplacement(existing: existing, incoming: item)
+                let awaitingReplacement = StashItem(
+                    id: existing.id,
+                    type: existing.type,
+                    content: existing.content,
+                    preview: existing.preview,
+                    createdAt: max(existing.createdAt, item.createdAt),
+                    isPinned: existing.isPinned,
+                    availability: existing.availability,
+                    managedOrigin: existing.managedOrigin,
+                    contentFingerprint: existing.contentFingerprint ?? item.contentFingerprint
+                )
+                insert(awaitingReplacement, into: &target)
+                return existing.id
+            }
             insert(refreshed, into: &target)
+            if item.type == .image, refreshed.content != item.content {
+                scheduleDiscard(of: item)
+            }
+            return refreshed.id
         } else {
             insert(item, into: &target)
+            return item.id
         }
+    }
+
+    private func queueClipboardImageReplacement(existing: StashItem, incoming: StashItem) {
+        let resolvedID = resolvedBootstrapItemID(existing.id)
+        guard !pendingImageReplacementIDs.contains(resolvedID) else {
+            scheduleDiscard(of: incoming)
+            return
+        }
+        let key = URL(fileURLWithPath: existing.content).standardizedFileURL.path
+        let pending = PendingClipboardImageReplacement(existing: existing, incoming: incoming)
+        if let superseded = pendingClipboardImageReplacements.updateValue(pending, forKey: key),
+           superseded.incoming.content != incoming.content {
+            scheduleDiscard(of: superseded.incoming)
+        }
+    }
+
+    private func clipboardDuplicateIndex(
+        for item: StashItem,
+        in target: [StashItem]
+    ) -> Int? {
+        target.firstIndex { existing in
+            guard existing.type == item.type,
+                  existing.managedOrigin == item.managedOrigin else { return false }
+            guard !pendingItemDeletionIDs.contains(existing.id) else { return false }
+            guard item.managedOrigin == .clipboard else {
+                return existing.content == item.content
+            }
+            guard !pendingClipboardCleanupIDs.contains(existing.id) else { return false }
+            if item.type == .image,
+               let existingFingerprint = existing.contentFingerprint,
+               let incomingFingerprint = item.contentFingerprint {
+                return existingFingerprint == incomingFingerprint
+            }
+            return existing.content == item.content
+        }
+    }
+
+    private func refreshedDuplicate(existing: StashItem, incoming: StashItem) -> StashItem {
+        guard incoming.managedOrigin == .clipboard else {
+            var refreshed = incoming
+            refreshed.isPinned = existing.isPinned
+            return refreshed
+        }
+
+        if existing.id == incoming.id,
+           existing.content == incoming.content {
+            return StashItem(
+                id: existing.id,
+                type: incoming.type,
+                content: incoming.content,
+                preview: incoming.preview,
+                createdAt: max(existing.createdAt, incoming.createdAt),
+                isPinned: existing.isPinned,
+                availability: incoming.availability,
+                managedOrigin: incoming.managedOrigin,
+                contentFingerprint: incoming.contentFingerprint ?? existing.contentFingerprint
+            )
+        }
+
+        let shouldUseIncomingBacking = existing.type == .image
+            && existing.availability != .available
+            && incoming.availability == .available
+        return StashItem(
+            id: existing.id,
+            type: existing.type,
+            content: shouldUseIncomingBacking ? incoming.content : existing.content,
+            preview: shouldUseIncomingBacking ? incoming.preview : existing.preview,
+            createdAt: max(existing.createdAt, incoming.createdAt),
+            isPinned: existing.isPinned,
+            availability: shouldUseIncomingBacking ? incoming.availability : existing.availability,
+            managedOrigin: existing.managedOrigin,
+            contentFingerprint: existing.contentFingerprint ?? incoming.contentFingerprint
+        )
+    }
+
+    private func scheduleDiscard(of item: StashItem) {
+        guard item.type == .image,
+              item.managedOrigin == .clipboard else { return }
+        let taskID = UUID()
+        let manager = fileManager
+        let task = Task { [weak self] in
+            await manager.discardUnregisteredClipboardImage(at: item.content)
+            self?.clipboardImageDiscardTasks[taskID] = nil
+        }
+        clipboardImageDiscardTasks[taskID] = task
+    }
+
+    private func schedulePendingRegisteredImageCleanups() {
+        let replacements = Array(pendingClipboardImageReplacements.values)
+        pendingClipboardImageReplacements.removeAll(keepingCapacity: true)
+        for replacement in replacements {
+            scheduleRegisteredImageReplacement(replacement)
+        }
+    }
+
+    private func scheduleRegisteredImageReplacement(_ replacement: PendingClipboardImageReplacement) {
+        let existing = replacement.existing
+        let incoming = replacement.incoming
+        guard existing.type == .image,
+              incoming.type == .image,
+              existing.managedOrigin == .clipboard,
+              incoming.managedOrigin == .clipboard else { return }
+        let resolvedID = resolvedBootstrapItemID(existing.id)
+        guard !pendingImageReplacementIDs.contains(resolvedID) else {
+            scheduleDiscard(of: incoming)
+            return
+        }
+        pendingImageReplacementIDs.insert(resolvedID)
+        let taskID = UUID()
+        let manager = fileManager
+        let storage = storageManager
+        let task = Task { [weak self] in
+            var intentWasPrepared = false
+            defer {
+                if let self {
+                    self.pendingImageReplacementIDs.remove(resolvedID)
+                    self.clipboardImageDiscardTasks[taskID] = nil
+                    if !self.isFlushingForTermination {
+                        self.applyClipboardRetentionPolicy()
+                    }
+                }
+            }
+            do {
+                let intent = try await manager.prepareClipboardImageReplacement(
+                    existing: existing,
+                    incoming: incoming
+                )
+                intentWasPrepared = true
+                guard let self,
+                      let current = self.items.first(where: {
+                          $0.id == resolvedID && $0.content == existing.content
+                      }) else { return }
+                let committed = StashItem(
+                    id: resolvedID,
+                    type: .image,
+                    content: intent.item.content,
+                    preview: intent.item.preview,
+                    createdAt: max(current.createdAt, intent.item.createdAt),
+                    isPinned: current.isPinned,
+                    availability: .available,
+                    managedOrigin: .clipboard,
+                    contentFingerprint: intent.item.contentFingerprint
+                )
+                self.items.removeAll { $0.id == resolvedID }
+                self.insert(committed, into: &self.items)
+                try await storage.flush()
+                guard self.items.contains(where: {
+                    $0.id == resolvedID && $0.content == committed.content
+                }), !self.items.contains(where: { $0.content == existing.content }) else { return }
+                var commitError: Error?
+                for attempt in 0...2 {
+                    do {
+                        try await manager.commitPreparedDeletion(manifestID: intent.manifestID)
+                        commitError = nil
+                        break
+                    } catch {
+                        commitError = error
+                        guard attempt < 2 else { break }
+                        try? await Task.sleep(
+                            nanoseconds: UInt64(100 * (attempt + 1)) * 1_000_000
+                        )
+                    }
+                }
+                if let commitError { throw commitError }
+                await manager.acknowledgeRecoveryManifests([intent.manifestID])
+            } catch {
+                guard let self else { return }
+                if !intentWasPrepared {
+                    self.scheduleDiscard(of: incoming)
+                }
+                self.lastError = "替换图片存储失败，将在下次启动时继续恢复：\(error.localizedDescription)"
+            }
+        }
+        clipboardImageDiscardTasks[taskID] = task
+    }
+
+    private func promoteClipboardItem(id: UUID, at observedAt: Date) {
+        let resolvedID = resolvedBootstrapItemID(id)
+        guard let existing = items.first(where: {
+            $0.id == resolvedID
+                && $0.managedOrigin == .clipboard
+                && !pendingClipboardCleanupIDs.contains($0.id)
+                && !pendingItemDeletionIDs.contains($0.id)
+        }) else { return }
+        addItem(StashItem(
+            id: existing.id,
+            type: existing.type,
+            content: existing.content,
+            preview: existing.preview,
+            createdAt: max(existing.createdAt, observedAt),
+            isPinned: existing.isPinned,
+            availability: existing.availability,
+            managedOrigin: existing.managedOrigin,
+            contentFingerprint: existing.contentFingerprint
+        ))
+    }
+
+    func promoteDuplicateClipboardImage(
+        fingerprint: String,
+        observedAt: Date,
+        isStillValid: ClipboardAsyncValidityCheck = {
+            withUnsafeCurrentTask { !($0?.isCancelled ?? false) }
+        }
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              isStillValid(),
+              let candidate = items.first(where: {
+            $0.type == .image
+                && $0.managedOrigin == .clipboard
+                && $0.contentFingerprint == fingerprint
+                && !pendingClipboardCleanupIDs.contains($0.id)
+                && !pendingItemDeletionIDs.contains($0.id)
+        }) else {
+            return false
+        }
+        let isReusable = await fileManager.isReusableClipboardImage(
+            at: candidate.content,
+            matching: fingerprint
+        )
+        guard !Task.isCancelled,
+              isStillValid(),
+              let current = items.first(where: {
+            $0.id == candidate.id
+                && $0.content == candidate.content
+                && $0.contentFingerprint == fingerprint
+                && !pendingClipboardCleanupIDs.contains($0.id)
+                && !pendingItemDeletionIDs.contains($0.id)
+        }) else { return false }
+        guard isReusable else {
+            guard !Task.isCancelled, isStillValid() else { return false }
+            let unavailable = StashItem(
+                id: current.id,
+                type: current.type,
+                content: current.content,
+                preview: current.preview,
+                createdAt: current.createdAt,
+                isPinned: current.isPinned,
+                availability: .unavailable,
+                managedOrigin: current.managedOrigin,
+                contentFingerprint: current.contentFingerprint
+            )
+            if isBootstrapping {
+                bootstrapMutations.append(.add(unavailable))
+            }
+            add(unavailable, to: &items)
+            return false
+        }
+        guard !Task.isCancelled, isStillValid() else { return false }
+        addItem(StashItem(
+            id: current.id,
+            type: current.type,
+            content: current.content,
+            preview: current.preview,
+            createdAt: max(current.createdAt, observedAt),
+            isPinned: current.isPinned,
+            availability: current.availability,
+            managedOrigin: current.managedOrigin,
+            contentFingerprint: fingerprint
+        ))
+        return true
     }
 
     private func insert(_ item: StashItem, into target: inout [StashItem]) {
@@ -536,41 +1115,110 @@ final class StashViewModel: ObservableObject {
     }
 
     func deleteItem(_ item: StashItem) {
+        guard !isFlushingForTermination else { return }
         guard item.type.isFileBacked else {
             removeItemMetadata(item)
             return
         }
 
-        Task {
-            guard await fileManager.isManagedFileAsync(at: item.content) else {
-                removeItemMetadata(item)
+        guard claimItemDeletion(item) else { return }
+        let manager = fileManager
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer { self.finishItemDeletion(item) }
+
+            let isManaged = await manager.isManagedFileAsync(at: item.content)
+            guard self.itemDeletionIsCurrent(item) else { return }
+            guard isManaged else {
+                self.removeItemMetadataIfCurrent(item)
                 return
             }
             do {
-                let manifestID = try await fileManager.quarantineManagedFile(at: item.content)
-                if let manifestID {
-                    pendingManifestAcknowledgements[manifestID] = revision &+ 1
+                let manifestID = try await manager.quarantineManagedFile(at: item.content)
+                guard self.itemDeletionIsCurrent(item) else {
+                    if let manifestID {
+                        self.pendingManifestAcknowledgements[manifestID] = self.revision
+                        self.acknowledgeManifests(persistedThrough: self.persistedRevision)
+                    }
+                    return
                 }
-                removeItemMetadata(item)
+                if let manifestID {
+                    self.pendingManifestAcknowledgements[manifestID] = self.revision &+ 1
+                }
+                self.removeItemMetadataIfCurrent(item)
             } catch {
-                lastError = "删除失败：\(error.localizedDescription)"
+                guard self.itemDeletionIsCurrent(item) else { return }
+                self.lastError = "删除失败：\(error.localizedDescription)"
             }
         }
+        itemDeletionTasks[item.id] = task
     }
 
-    private func removeItemMetadata(_ item: StashItem) {
+    private func claimItemDeletion(_ item: StashItem) -> Bool {
+        let resolvedID = resolvedBootstrapItemID(item.id)
+        guard !pendingItemDeletionIDs.contains(resolvedID),
+              !pendingClipboardCleanupIDs.contains(resolvedID),
+              !pendingImageReplacementIDs.contains(resolvedID),
+              (pendingClipboardCopyCounts[resolvedID] ?? 0) == 0,
+              currentItem(matching: item) != nil else {
+            if (pendingClipboardCopyCounts[resolvedID] ?? 0) > 0 {
+                lastError = "该记录正在复制，暂时无法删除"
+            }
+            return false
+        }
+        pendingItemDeletionIDs.insert(resolvedID)
+        rescheduleClipboardRetention(now: retentionNowProvider())
+        return true
+    }
+
+    private func itemDeletionIsCurrent(_ item: StashItem) -> Bool {
+        let resolvedID = resolvedBootstrapItemID(item.id)
+        return pendingItemDeletionIDs.contains(resolvedID)
+            && currentItem(matching: item) != nil
+    }
+
+    private func finishItemDeletion(_ item: StashItem) {
+        pendingItemDeletionIDs.remove(resolvedBootstrapItemID(item.id))
+        itemDeletionTasks[item.id] = nil
+        rescheduleClipboardRetention(now: retentionNowProvider())
+    }
+
+    @discardableResult
+    private func removeItemMetadataIfCurrent(_ item: StashItem) -> Bool {
+        let resolvedID = resolvedBootstrapItemID(item.id)
+        guard currentItem(matching: item) != nil else {
+            return false
+        }
         if isBootstrapping {
             bootstrapMutations.append(.delete(item.id))
         }
-        items.removeAll { $0.id == item.id }
+        items.removeAll { $0.id == resolvedID && $0.content == item.content }
+        return true
+    }
+
+    private func removeItemMetadata(_ item: StashItem) {
+        let resolvedID = resolvedBootstrapItemID(item.id)
+        if isBootstrapping {
+            bootstrapMutations.append(.delete(item.id))
+        }
+        items.removeAll { $0.id == resolvedID && $0.content == item.content }
     }
 
     func togglePin(_ item: StashItem) {
-        guard !pendingClipboardCleanupIDs.contains(item.id) else {
+        guard !isFlushingForTermination else { return }
+        guard let current = currentItem(
+            matching: item,
+            allowEquivalentBootstrapImageBacking: true
+        ),
+        !pendingClipboardCleanupIDs.contains(current.id),
+        !pendingItemDeletionIDs.contains(current.id),
+        !pendingImageReplacementIDs.contains(current.id) else {
             lastError = "该记录正在清理，暂时无法更改固定状态"
             return
         }
-        if let index = items.firstIndex(where: { $0.id == item.id }) {
+        if let index = items.firstIndex(where: {
+            $0.id == current.id && $0.content == current.content
+        }) {
             if isBootstrapping {
                 bootstrapMutations.append(.togglePin(item.id))
             }
@@ -582,11 +1230,16 @@ final class StashViewModel: ObservableObject {
     }
 
     func updateClipboardRetentionPolicy(_ policy: ClipboardRetentionPolicy) {
+        guard !isFlushingForTermination else { return }
         clipboardRetentionPolicy = policy
         applyClipboardRetentionPolicy()
     }
 
     func applyClipboardRetentionPolicy(now explicitNow: Date? = nil) {
+        guard !isFlushingForTermination else {
+            clipboardRetentionScheduler.cancel()
+            return
+        }
         let now = explicitNow ?? retentionNowProvider()
         let plannedIDs = ClipboardRetentionPlanner.itemIDsToRemove(
             from: items,
@@ -596,24 +1249,45 @@ final class StashViewModel: ObservableObject {
         let ids = claimClipboardCleanupIDs(plannedIDs, now: now)
         rescheduleClipboardRetention(now: now)
         guard !ids.isEmpty else { return }
-        Task { [weak self] in
-            _ = await self?.removeClipboardItems(ids: ids, reportFailure: true)
+        let taskID = UUID()
+        let task = Task { [weak self] in
+            guard let self else {
+                return ClipboardClearResult(removedCount: 0, failedCount: 0)
+            }
+            defer { self.clipboardCleanupTasks[taskID] = nil }
+            return await self.removeClipboardItems(ids: ids, reportFailure: true)
         }
+        clipboardCleanupTasks[taskID] = task
     }
 
     @discardableResult
     func clearUnpinnedClipboardItems() async -> ClipboardClearResult {
+        guard !isFlushingForTermination else {
+            return ClipboardClearResult(removedCount: 0, failedCount: 0)
+        }
         clipboardCaptureInvalidator()
         let candidates = Set(items.lazy.filter {
             $0.managedOrigin == .clipboard && !$0.isPinned
         }.map(\.id))
         let ids = claimClipboardCleanupIDs(candidates, now: retentionNowProvider())
-        return await removeClipboardItems(ids: ids, reportFailure: true)
+        let taskID = UUID()
+        let task = Task { [weak self] in
+            guard let self else {
+                return ClipboardClearResult(removedCount: 0, failedCount: 0)
+            }
+            defer { self.clipboardCleanupTasks[taskID] = nil }
+            return await self.removeClipboardItems(ids: ids, reportFailure: true)
+        }
+        clipboardCleanupTasks[taskID] = task
+        return await task.value
     }
 
     private func claimClipboardCleanupIDs(_ ids: Set<UUID>, now: Date) -> Set<UUID> {
         let claimed = Set(ids.filter { id in
             guard !pendingClipboardCleanupIDs.contains(id),
+                  !pendingItemDeletionIDs.contains(id),
+                  !pendingImageReplacementIDs.contains(id),
+                  (pendingClipboardCopyCounts[id] ?? 0) == 0,
                   clipboardCleanupRetryAfter[id].map({ $0 <= now }) ?? true,
                   let item = items.first(where: { $0.id == id }) else { return false }
             return item.managedOrigin == .clipboard && !item.isPinned
@@ -634,6 +1308,9 @@ final class StashViewModel: ObservableObject {
         var processedIDs = Set<UUID>()
         for id in ids {
             guard pendingClipboardCleanupIDs.contains(id),
+                  !pendingItemDeletionIDs.contains(id),
+                  !pendingImageReplacementIDs.contains(id),
+                  (pendingClipboardCopyCounts[id] ?? 0) == 0,
                   let item = items.first(where: { $0.id == id }),
                   item.managedOrigin == .clipboard,
                   !item.isPinned else {
@@ -647,6 +1324,9 @@ final class StashViewModel: ObservableObject {
                         manifestIDs.append(manifestID)
                     }
                     if pendingClipboardCleanupIDs.contains(id),
+                       !pendingItemDeletionIDs.contains(id),
+                       !pendingImageReplacementIDs.contains(id),
+                       (pendingClipboardCopyCounts[id] ?? 0) == 0,
                        let current = items.first(where: { $0.id == id }),
                        current.managedOrigin == .clipboard,
                        !current.isPinned {
@@ -660,6 +1340,9 @@ final class StashViewModel: ObservableObject {
                 }
             } else {
                 if pendingClipboardCleanupIDs.contains(id),
+                   !pendingItemDeletionIDs.contains(id),
+                   !pendingImageReplacementIDs.contains(id),
+                   (pendingClipboardCopyCounts[id] ?? 0) == 0,
                    let current = items.first(where: { $0.id == id }),
                    current.managedOrigin == .clipboard,
                    !current.isPinned {
@@ -681,6 +1364,9 @@ final class StashViewModel: ObservableObject {
             items.removeAll {
                 removableIDs.contains($0.id)
                     && pendingClipboardCleanupIDs.contains($0.id)
+                    && !pendingItemDeletionIDs.contains($0.id)
+                    && !pendingImageReplacementIDs.contains($0.id)
+                    && (pendingClipboardCopyCounts[$0.id] ?? 0) == 0
                     && $0.managedOrigin == .clipboard
                     && !$0.isPinned
             }
@@ -695,6 +1381,7 @@ final class StashViewModel: ObservableObject {
 
     private func rescheduleClipboardRetention(now: Date) {
         clipboardRetentionScheduler.cancel()
+        guard !isFlushingForTermination else { return }
         guard let days = clipboardRetentionPolicy.maximumAgeDays else { return }
         let calendar = Calendar(identifier: .gregorian)
         let nextDate = items.lazy
@@ -702,6 +1389,9 @@ final class StashViewModel: ObservableObject {
                 $0.managedOrigin == .clipboard
                     && !$0.isPinned
                     && !self.pendingClipboardCleanupIDs.contains($0.id)
+                    && !self.pendingItemDeletionIDs.contains($0.id)
+                    && !self.pendingImageReplacementIDs.contains($0.id)
+                    && (self.pendingClipboardCopyCounts[$0.id] ?? 0) == 0
             }
             .compactMap { item -> Date? in
                 guard let expiration = calendar.date(byAdding: .day, value: days, to: item.createdAt) else {
@@ -719,7 +1409,7 @@ final class StashViewModel: ObservableObject {
     }
 
     func importFiles(_ urls: [URL], retryOfJobID: UUID? = nil) async {
-        guard !urls.isEmpty else { return }
+        guard !urls.isEmpty, !isFlushingForTermination else { return }
         let job = ImportJob(sourceURLs: urls, retryOfJobID: retryOfJobID)
         let jobID = job.id
         let cancellationToken = ImportCancellationToken()
@@ -737,6 +1427,7 @@ final class StashViewModel: ObservableObject {
         progressRelay.flush()
         importProgressRelays[jobID] = nil
         importCancellationTokens[jobID] = nil
+        guard !isFlushingForTermination else { return }
 
         guard let jobIndex = importJobs.firstIndex(where: { $0.id == jobID }) else { return }
         let uniqueItems = batch.items.filter { newItem in
@@ -789,6 +1480,7 @@ final class StashViewModel: ObservableObject {
     }
 
     func cancelImport(_ jobID: UUID) {
+        guard !isFlushingForTermination else { return }
         guard let index = importJobs.firstIndex(where: { $0.id == jobID }),
               importJobs[index].canCancel,
               let token = importCancellationTokens[jobID] else { return }
@@ -799,6 +1491,7 @@ final class StashViewModel: ObservableObject {
     }
 
     func retryImport(_ jobID: UUID) {
+        guard !isFlushingForTermination else { return }
         guard let index = importJobs.firstIndex(where: { $0.id == jobID }) else { return }
         var updatedJobs = importJobs
         guard let retryURLs = updatedJobs[index].consumeRetryURLs() else { return }
@@ -809,6 +1502,7 @@ final class StashViewModel: ObservableObject {
     }
 
     func dismissImportJob(_ jobID: UUID) {
+        guard !isFlushingForTermination else { return }
         guard let job = importJobs.first(where: { $0.id == jobID }),
               !job.state.isActive,
               !job.needsRecovery else { return }
@@ -816,6 +1510,7 @@ final class StashViewModel: ObservableObject {
     }
 
     private func applyImportProgress(_ progress: FileImportProgress, to jobID: UUID) {
+        guard !isFlushingForTermination else { return }
         guard let index = importJobs.firstIndex(where: { $0.id == jobID }),
               importJobs[index].state.isActive else { return }
         var updatedJobs = importJobs

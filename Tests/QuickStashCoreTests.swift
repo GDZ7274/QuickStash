@@ -154,6 +154,30 @@ private final class WriteCounter: @unchecked Sendable {
     var value: Int { lock.withLock { count } }
 }
 
+private actor AsyncTestGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var waitCount = 0
+
+    func wait() async {
+        waitCount += 1
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll(keepingCapacity: false)
+        for waiter in pending {
+            waiter.resume()
+        }
+    }
+}
+
 enum TestFailure: Error, CustomStringConvertible {
     case assertion(String)
 
@@ -190,8 +214,16 @@ struct QuickStashCoreTests {
         try await testCleanupFailuresNeedRecovery(in: testRoot)
         try await testInterruptedImportRecovery(in: testRoot)
         try await testDeletionTombstoneRecovery(in: testRoot)
+        try await testDeletionTombstonePreservesReusedPath(in: testRoot)
+        try await testClipboardDiscardTombstoneRecovery(in: testRoot)
+        try await testInvalidClipboardOrphanPreservesPathText(in: testRoot)
+        try await testManagedPathAliasDoesNotSelfDelete(in: testRoot)
+        try await testClipboardReplacementRecoversBeforeIntent(in: testRoot)
+        try await testClipboardReplacementIntentRecovery(in: testRoot)
+        try await testLegacyClipboardImageFingerprintMigration(in: testRoot)
         try await testManifestCommitFailureRecovery(in: testRoot)
         try await testCapacityDropDuringCopy(in: testRoot)
+        try await testTerminationDeadlineDoesNotAwaitCancelledDrain()
         try testProgressRateLimit()
         try testImportJobStateReduction()
 
@@ -200,6 +232,89 @@ struct QuickStashCoreTests {
 
     private static func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         guard condition() else { throw TestFailure.assertion(message) }
+    }
+
+    @MainActor
+    private static func testTerminationDeadlineDoesNotAwaitCancelledDrain() async throws {
+        let drainGate = AsyncTestGate()
+        let deadlineGate = AsyncTestGate()
+        let deadlineNanoseconds: UInt64 = 123
+        var replies: [Bool] = []
+        var drainReturned = false
+
+        let coordinator = TerminationDeadlineCoordinator(
+            deadlineNanoseconds: deadlineNanoseconds,
+            sleepOperation: { receivedNanoseconds in
+                guard receivedNanoseconds == deadlineNanoseconds else {
+                    throw TestFailure.assertion("Termination coordinator changed its injected deadline")
+                }
+                await deadlineGate.wait()
+            }
+        )
+        let started = coordinator.start(
+            drain: {
+                await drainGate.wait()
+                drainReturned = true
+            },
+            reply: { timedOut in
+                replies.append(timedOut)
+            }
+        )
+        try expect(started, "Termination coordinator did not start")
+
+        for _ in 0..<1_000 where await drainGate.waitCount == 0 {
+            await Task.yield()
+        }
+        let drainWaitCount = await drainGate.waitCount
+        try expect(drainWaitCount == 1, "Termination drain did not start")
+        for _ in 0..<1_000 where await deadlineGate.waitCount == 0 {
+            await Task.yield()
+        }
+        let deadlineWaitCount = await deadlineGate.waitCount
+        try expect(deadlineWaitCount == 1, "Termination deadline did not start")
+
+        await deadlineGate.open()
+        for _ in 0..<1_000 where replies.isEmpty {
+            await Task.yield()
+        }
+        try expect(replies == [true], "Termination deadline did not reply exactly once")
+        try expect(coordinator.didTimeOut, "Termination coordinator did not record its timeout")
+        try expect(!drainReturned, "Termination deadline waited for a non-cooperative drain")
+        try expect(
+            !coordinator.start(drain: {}, reply: { _ in }),
+            "Termination coordinator restarted after replying"
+        )
+
+        await drainGate.open()
+        for _ in 0..<1_000 where !drainReturned {
+            await Task.yield()
+        }
+        try expect(drainReturned, "Cancelled termination drain did not release during test cleanup")
+        try expect(replies == [true], "Late termination drain replied a second time")
+
+        let normalDeadlineGate = AsyncTestGate()
+        var normalReplies: [Bool] = []
+        let normalCoordinator = TerminationDeadlineCoordinator(
+            deadlineNanoseconds: deadlineNanoseconds,
+            sleepOperation: { _ in await normalDeadlineGate.wait() }
+        )
+        try expect(
+            normalCoordinator.start(
+                drain: {},
+                reply: { timedOut in normalReplies.append(timedOut) }
+            ),
+            "Termination coordinator did not start its normal completion path"
+        )
+        for _ in 0..<1_000 where normalReplies.isEmpty {
+            await Task.yield()
+        }
+        try expect(normalReplies == [false], "Completed termination drain did not reply exactly once")
+        try expect(!normalCoordinator.didTimeOut, "Completed termination drain was marked as timed out")
+        await normalDeadlineGate.open()
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+        try expect(normalReplies == [false], "Cancelled termination deadline replied after drain completion")
     }
 
     private static func validPNGFixture() throws -> Data {
@@ -1167,15 +1282,49 @@ struct QuickStashCoreTests {
             trashPath: destination.path
         )).write(to: manifestURL, options: [.atomic])
         let stored = StashItem(type: .file, content: source.path, preview: "delete", isPinned: true)
+        let pathText = StashItem(
+            type: .text,
+            content: source.path,
+            preview: "copied managed path",
+            managedOrigin: .clipboard
+        )
+        let pathURL = StashItem(
+            type: .url,
+            content: source.path,
+            preview: "path-shaped URL",
+            managedOrigin: .clipboard
+        )
         let manager = QuickStashFileManager(baseDirectory: base)
-        let recovered = await manager.recoverManagedFiles(referencedBy: [stored])
+        let recovered = await manager.recoverManagedFiles(referencedBy: [stored, pathText, pathURL])
         try expect(!FileManager.default.fileExists(atPath: source.path), "Recovery did not complete tombstoned deletion")
         try expect(FileManager.default.fileExists(atPath: destination.path), "Recovered deletion was not quarantined")
-        try expect(recovered.items.allSatisfy { $0.content != source.path }, "Tombstoned source re-entered metadata")
+        try expect(
+            !recovered.items.contains(where: { $0.id == stored.id }),
+            "Tombstoned source re-entered metadata"
+        )
+        try expect(
+            recovered.items.contains(where: { $0.id == pathText.id }),
+            "Deletion path filtering removed text whose content matched a managed path"
+        )
+        try expect(
+            recovered.items.contains(where: { $0.id == pathURL.id }),
+            "Deletion path filtering removed URL metadata whose content matched a managed path"
+        )
         try expect(recovered.manifestIDsToAcknowledge.contains(manifestID), "Deletion tombstone was not held for durable ack")
         try expect(FileManager.default.fileExists(atPath: manifestURL.path), "Deletion tombstone was removed before metadata durability")
 
-        manager.acknowledgeRecoveryManifests([manifestID])
+        let replacementBytes = Data("new-file-at-reused-path".utf8)
+        try replacementBytes.write(to: source)
+        await manager.acknowledgeRecoveryManifests([manifestID])
+        try expect(
+            FileManager.default.fileExists(atPath: source.path),
+            "Acknowledging an old tombstone removed a new file at the reused path"
+        )
+        let retainedReplacementBytes = try Data(contentsOf: source)
+        try expect(
+            retainedReplacementBytes == replacementBytes,
+            "Acknowledging an old tombstone changed a new file at the reused path"
+        )
         _ = await manager.recoverManagedFiles(referencedBy: recovered.items)
         try expect(!FileManager.default.fileExists(atPath: manifestURL.path), "Durable deletion tombstone ack did not remove manifest")
 
@@ -1253,6 +1402,350 @@ struct QuickStashCoreTests {
             !tamperedRecovery.manifestIDsToAcknowledge.contains(tamperedID),
             "Tampered deletion manifest was acknowledged"
         )
+    }
+
+    private static func testDeletionTombstonePreservesReusedPath(in root: URL) async throws {
+        let sourceDirectory = root.appendingPathComponent("reused-deletion-source", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+        let source = sourceDirectory.appendingPathComponent("same-name.txt")
+        try Data("original-managed-file".utf8).write(to: source)
+
+        let base = root.appendingPathComponent("reused-deletion-path", isDirectory: true)
+        let manager = QuickStashFileManager(
+            baseDirectory: base,
+            importPolicy: policy(),
+            availableCapacityProvider: { _ in Int64.max }
+        )
+        let imported = await manager.importFiles([source])
+        guard let original = imported.items.first else {
+            throw TestFailure.assertion("Could not create reused-path deletion fixture")
+        }
+        if let importManifestID = imported.manifestID {
+            await manager.acknowledgeRecoveryManifests([importManifestID])
+        }
+        guard let deletionManifestID = try await manager.quarantineManagedFile(at: original.content) else {
+            throw TestFailure.assertion("Deleting reused-path fixture did not create a tombstone")
+        }
+        try expect(
+            !FileManager.default.fileExists(atPath: original.content),
+            "Deleting reused-path fixture did not quarantine the original file"
+        )
+
+        let replacementBytes = Data("new-managed-file-at-same-path".utf8)
+        try replacementBytes.write(to: URL(fileURLWithPath: original.content), options: .atomic)
+        let replacement = StashItem(
+            type: original.type,
+            content: original.content,
+            preview: "replacement",
+            createdAt: original.createdAt.addingTimeInterval(1),
+            managedOrigin: .imported
+        )
+
+        let restarted = QuickStashFileManager(baseDirectory: base)
+        let recovered = await restarted.recoverManagedFiles(referencedBy: [replacement])
+        try expect(
+            FileManager.default.fileExists(atPath: original.content),
+            "Crash recovery moved a new file that reused an old tombstoned path"
+        )
+        let retainedBytes = try Data(contentsOf: URL(fileURLWithPath: original.content))
+        try expect(retainedBytes == replacementBytes, "Crash recovery changed the reused-path file")
+        try expect(
+            recovered.items.contains(where: { $0.id == replacement.id }),
+            "Crash recovery removed metadata for the reused-path file"
+        )
+        try expect(
+            recovered.manifestIDsToAcknowledge.contains(deletionManifestID),
+            "Crash recovery did not retire the obsolete tombstone"
+        )
+        try expect(
+            !recovered.deletedItemPaths.contains(
+                URL(fileURLWithPath: replacement.content).resolvingSymlinksInPath().path
+            ),
+            "Crash recovery marked the reused path as deleted"
+        )
+        await restarted.acknowledgeRecoveryManifests(recovered.manifestIDsToAcknowledge)
+    }
+
+    private static func testClipboardDiscardTombstoneRecovery(in root: URL) async throws {
+        let base = root.appendingPathComponent("clipboard-discard-tombstone", isDirectory: true)
+        let failingManager = QuickStashFileManager(
+            baseDirectory: base,
+            cleanupFaultInjector: { operation in
+                if operation.kind == .committedQuarantine {
+                    throw InjectedCleanupError()
+                }
+            }
+        )
+        let duplicate = try await failingManager.saveClipboardImage(
+            data: try validPNGFixture(),
+            fileExtension: "png"
+        )
+        await failingManager.discardUnregisteredClipboardImage(at: duplicate.content)
+        try expect(
+            FileManager.default.fileExists(atPath: duplicate.content),
+            "Injected duplicate discard unexpectedly removed its source"
+        )
+
+        let manifestDirectory = base.appendingPathComponent(
+            "QuickStash/DeletionManifests",
+            isDirectory: true
+        )
+        let manifests = try FileManager.default.contentsOfDirectory(
+            at: manifestDirectory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "json" }
+        try expect(manifests.count == 1, "Failed duplicate discard did not retain a deletion intent")
+
+        let recoveryManager = QuickStashFileManager(baseDirectory: base)
+        let recovered = await recoveryManager.recoverManagedFiles(referencedBy: [])
+        try expect(
+            recovered.items.allSatisfy { $0.content != duplicate.content },
+            "Failed duplicate discard reappeared as an Images orphan"
+        )
+        try expect(
+            !FileManager.default.fileExists(atPath: duplicate.content),
+            "Recovery did not finish the failed duplicate discard"
+        )
+        try expect(
+            recovered.manifestIDsToAcknowledge.count == 1,
+            "Recovered duplicate discard was not held for durable metadata acknowledgement"
+        )
+    }
+
+    private static func testInvalidClipboardOrphanPreservesPathText(in root: URL) async throws {
+        let base = root.appendingPathComponent("invalid-clipboard-orphan-path-text", isDirectory: true)
+        let manager = QuickStashFileManager(baseDirectory: base)
+        let orphan = try await manager.saveClipboardImage(
+            data: try validPNGFixture(),
+            fileExtension: "png"
+        )
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(
+            to: URL(fileURLWithPath: orphan.content),
+            options: .atomic
+        )
+        let pathText = StashItem(
+            type: .text,
+            content: orphan.content,
+            preview: "copied orphan path",
+            managedOrigin: .clipboard
+        )
+        let pathURL = StashItem(
+            type: .url,
+            content: orphan.content,
+            preview: "path-shaped URL",
+            managedOrigin: .clipboard
+        )
+
+        let recovered = await manager.recoverManagedFiles(referencedBy: [pathText, pathURL])
+        try expect(
+            recovered.items.contains(where: { $0.id == pathText.id }),
+            "Invalid orphan cleanup removed text whose content matched the orphan path"
+        )
+        try expect(
+            recovered.items.contains(where: { $0.id == pathURL.id }),
+            "Invalid orphan cleanup removed URL metadata whose content matched the orphan path"
+        )
+        try expect(
+            !recovered.items.contains(where: {
+                $0.type == .image
+                    && URL(fileURLWithPath: $0.content).resolvingSymlinksInPath().path
+                        == URL(fileURLWithPath: orphan.content).resolvingSymlinksInPath().path
+            }),
+            "Invalid clipboard orphan was recovered as usable history"
+        )
+        try expect(
+            !FileManager.default.fileExists(atPath: orphan.content),
+            "Invalid clipboard orphan was not quarantined"
+        )
+    }
+
+    private static func testManagedPathAliasDoesNotSelfDelete(in root: URL) async throws {
+        let base = root.appendingPathComponent("managed-path-alias", isDirectory: true)
+        let manager = QuickStashFileManager(baseDirectory: base)
+        let image = try await manager.saveClipboardImage(
+            data: try validPNGFixture(),
+            fileExtension: "png"
+        )
+        let aliasRoot = root.appendingPathComponent("managed-path-alias-link")
+        try FileManager.default.createSymbolicLink(at: aliasRoot, withDestinationURL: base)
+        let aliasPath = aliasRoot
+            .appendingPathComponent("QuickStash/Images", isDirectory: true)
+            .appendingPathComponent(URL(fileURLWithPath: image.content).lastPathComponent)
+            .path
+        let aliasedItem = StashItem(
+            id: image.id,
+            type: image.type,
+            content: aliasPath,
+            preview: image.preview,
+            createdAt: image.createdAt,
+            isPinned: image.isPinned,
+            availability: image.availability,
+            managedOrigin: image.managedOrigin,
+            contentFingerprint: image.contentFingerprint
+        )
+
+        let recovered = await manager.recoverManagedFiles(referencedBy: [aliasedItem])
+        let matchingItems = recovered.items.filter { $0.id == image.id }
+        try expect(matchingItems.count == 1, "A managed path alias was recovered as a duplicate item")
+        try expect(
+            FileManager.default.fileExists(atPath: image.content),
+            "Alias deduplication quarantined its own canonical backing"
+        )
+        try expect(
+            recovered.manifestIDsToAcknowledge.isEmpty,
+            "Alias deduplication created an unnecessary deletion intent"
+        )
+    }
+
+    private static func testClipboardReplacementIntentRecovery(in root: URL) async throws {
+        let base = root.appendingPathComponent("clipboard-replacement-intent", isDirectory: true)
+        let manager = QuickStashFileManager(baseDirectory: base)
+        let png = try validPNGFixture()
+        var canonical = try await manager.saveClipboardImage(
+            data: png,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 1_000)
+        )
+        canonical.isPinned = true
+        let incoming = try await manager.saveClipboardImage(
+            data: png,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 2_000)
+        )
+        let intent = try await manager.prepareClipboardImageReplacement(
+            existing: canonical,
+            incoming: incoming
+        )
+        let pathText = StashItem(
+            type: .text,
+            content: incoming.content,
+            preview: "copied replacement path",
+            managedOrigin: .clipboard
+        )
+        let pathURL = StashItem(
+            type: .url,
+            content: incoming.content,
+            preview: "path-shaped URL",
+            managedOrigin: .clipboard
+        )
+
+        let restarted = QuickStashFileManager(baseDirectory: base)
+        let recovered = await restarted.recoverManagedFiles(referencedBy: [canonical, pathText, pathURL])
+        guard let retained = recovered.items.first(where: { $0.id == canonical.id }) else {
+            throw TestFailure.assertion("Replacement intent recovery lost the canonical ID")
+        }
+        try expect(retained.content == incoming.content, "Replacement intent recovery kept the old backing")
+        try expect(retained.isPinned, "Replacement intent recovery lost the canonical pin")
+        try expect(retained.createdAt == incoming.createdAt, "Replacement intent recovery lost the newest timestamp")
+        try expect(!FileManager.default.fileExists(atPath: canonical.content), "Replacement recovery kept the old backing")
+        try expect(FileManager.default.fileExists(atPath: incoming.content), "Replacement recovery removed the new backing")
+        try expect(
+            recovered.items.contains(where: { $0.id == pathText.id }),
+            "Replacement recovery removed text whose content matched the new backing path"
+        )
+        try expect(
+            recovered.items.contains(where: { $0.id == pathURL.id }),
+            "Replacement recovery removed URL metadata whose content matched the new backing path"
+        )
+        try expect(
+            recovered.manifestIDsToAcknowledge.contains(intent.manifestID),
+            "Replacement intent was acknowledged before recovered metadata became durable"
+        )
+    }
+
+    private static func testClipboardReplacementRecoversBeforeIntent(in root: URL) async throws {
+        let base = root.appendingPathComponent("clipboard-replacement-before-intent", isDirectory: true)
+        let manager = QuickStashFileManager(baseDirectory: base)
+        let png = try validPNGFixture()
+        var canonical = try await manager.saveClipboardImage(
+            data: png,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 1_500)
+        )
+        canonical.isPinned = true
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(
+            to: URL(fileURLWithPath: canonical.content),
+            options: .atomic
+        )
+        let incoming = try await manager.saveClipboardImage(
+            data: png,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 2_500)
+        )
+
+        let restarted = QuickStashFileManager(baseDirectory: base)
+        let recovered = await restarted.recoverManagedFiles(referencedBy: [canonical])
+        guard let retained = recovered.items.first(where: { $0.id == canonical.id }) else {
+            throw TestFailure.assertion("Pre-intent replacement recovery lost the canonical ID")
+        }
+        try expect(recovered.items.count == 1, "Pre-intent replacement recovery left duplicate metadata")
+        try expect(
+            URL(fileURLWithPath: retained.content).resolvingSymlinksInPath().standardizedFileURL
+                == URL(fileURLWithPath: incoming.content).resolvingSymlinksInPath().standardizedFileURL,
+            "Pre-intent replacement did not adopt the valid orphan"
+        )
+        try expect(retained.isPinned, "Pre-intent replacement recovery lost the canonical pin")
+        try expect(retained.createdAt == incoming.createdAt, "Pre-intent replacement lost the latest timestamp")
+        try expect(retained.availability == .available, "Pre-intent replacement remained unavailable")
+        try expect(
+            FileManager.default.fileExists(atPath: canonical.content),
+            "Pre-intent recovery moved the old backing before replacement metadata was durable"
+        )
+        try expect(
+            !recovered.manifestIDsToAcknowledge.isEmpty,
+            "Pre-intent replacement did not retain cleanup intent through metadata persistence"
+        )
+        try expect(FileManager.default.fileExists(atPath: incoming.content), "Pre-intent recovery removed valid backing")
+
+        await restarted.acknowledgeRecoveryManifests(recovered.manifestIDsToAcknowledge)
+        let afterAcknowledgement = await restarted.recoverManagedFiles(referencedBy: recovered.items)
+        try expect(
+            afterAcknowledgement.items.contains(where: { $0.id == canonical.id }),
+            "Pre-intent replacement lost canonical metadata after cleanup acknowledgement"
+        )
+        try expect(!FileManager.default.fileExists(atPath: canonical.content), "Pre-intent recovery kept corrupt backing")
+        try expect(FileManager.default.fileExists(atPath: incoming.content), "Pre-intent cleanup removed valid backing")
+    }
+
+    private static func testLegacyClipboardImageFingerprintMigration(in root: URL) async throws {
+        let base = root.appendingPathComponent("clipboard-fingerprint-migration", isDirectory: true)
+        let manager = QuickStashFileManager(baseDirectory: base)
+        let png = try validPNGFixture()
+        let canonical = try await manager.saveClipboardImage(
+            data: png,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 3_000)
+        )
+        var duplicate = try await manager.saveClipboardImage(
+            data: png,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 4_000)
+        )
+        duplicate.isPinned = true
+
+        let recovered = await manager.recoverManagedFiles(referencedBy: [duplicate, canonical])
+        let matches = recovered.items.filter {
+            $0.type == .image && $0.contentFingerprint == canonical.contentFingerprint
+        }
+        try expect(matches.count == 1, "Legacy same-pixel images were not migrated to one record")
+        try expect(matches[0].id == canonical.id, "Legacy migration did not retain the earliest canonical record")
+        try expect(matches[0].content == canonical.content, "Legacy migration replaced the canonical backing")
+        try expect(matches[0].isPinned, "Legacy migration did not merge pinned state")
+        try expect(matches[0].createdAt == duplicate.createdAt, "Legacy migration did not keep the latest timestamp")
+        try expect(FileManager.default.fileExists(atPath: canonical.content), "Legacy migration removed the canonical backing")
+        try expect(
+            FileManager.default.fileExists(atPath: duplicate.content),
+            "Legacy migration removed duplicate backing before metadata was durable"
+        )
+        try expect(
+            !recovered.manifestIDsToAcknowledge.isEmpty,
+            "Legacy migration did not retain cleanup intent through metadata persistence"
+        )
+
+        await manager.acknowledgeRecoveryManifests(recovered.manifestIDsToAcknowledge)
+        let afterAcknowledgement = await manager.recoverManagedFiles(referencedBy: recovered.items)
+        try expect(afterAcknowledgement.items.count == 1, "Legacy migration changed after cleanup acknowledgement")
+        try expect(!FileManager.default.fileExists(atPath: duplicate.content), "Legacy migration kept duplicate backing data")
     }
 
     private static func testManifestCommitFailureRecovery(in root: URL) async throws {

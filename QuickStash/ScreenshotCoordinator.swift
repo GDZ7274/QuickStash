@@ -403,11 +403,23 @@ final class ScreenshotCoordinator: ObservableObject, ScreenshotCanvasDelegate {
                     throw ScreenshotOutputError.clipboardWriteFailed
                 }
 
-                if let preparedHistoryItem,
-                   !clipboardMonitor.commitPreparedImageRecord(preparedHistoryItem) {
-                    await clipboardMonitor.discardPreparedImageRecord(preparedHistoryItem)
-                    historyWarning = "截图已复制，但 QuickStash 历史暂时不可用"
+                if let preparedHistoryItem {
+                    let didCommitHistory = await clipboardMonitor.commitPreparedImageRecord(
+                        preparedHistoryItem,
+                        isStillValid: { [weak self] in
+                            guard let self else { return false }
+                            return self.activeOutputID == operationID
+                                && self.sessionGate.accepts(token)
+                        }
+                    )
+                    if !didCommitHistory {
+                        await clipboardMonitor.discardPreparedImageRecord(preparedHistoryItem)
+                        historyWarning = "截图已复制，但 QuickStash 历史暂时不可用"
+                    }
                 }
+                try Task.checkCancellation()
+                guard self.activeOutputID == operationID,
+                      self.sessionGate.accepts(token) else { return }
                 if let historyWarning {
                     self.report(historyWarning)
                 }

@@ -30,6 +30,7 @@
 		A21 /* ScreenshotCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B22 /* ScreenshotCoordinator.swift */; };
 		A22 /* DebugScreenshotStressHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = B23 /* DebugScreenshotStressHarness.swift */; };
 		A23 /* ClipboardPasteboardHelperClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B24 /* ClipboardPasteboardHelperClient.swift */; };
+		A24 /* TerminationDeadlineCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B25 /* TerminationDeadlineCoordinator.swift */; };
 		HA1 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = HB1 /* main.swift */; };
 		HA2 /* QuickStashClipboardReader in Embed Clipboard Helper */ = {isa = PBXBuildFile; fileRef = HC1 /* QuickStashClipboardReader */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 		TA1 /* QuickStashXCTest.swift in Sources */ = {isa = PBXBuildFile; fileRef = TB1 /* QuickStashXCTest.swift */; };
@@ -91,6 +92,7 @@
 		B22 /* ScreenshotCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotCoordinator.swift; sourceTree = "<group>"; };
 		B23 /* DebugScreenshotStressHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugScreenshotStressHarness.swift; sourceTree = "<group>"; };
 		B24 /* ClipboardPasteboardHelperClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardPasteboardHelperClient.swift; sourceTree = "<group>"; };
+		B25 /* TerminationDeadlineCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminationDeadlineCoordinator.swift; sourceTree = "<group>"; };
 		HB1 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		HC1 /* QuickStashClipboardReader */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = QuickStashClipboardReader; sourceTree = BUILT_PRODUCTS_DIR; };
 		TB1 /* QuickStashXCTest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickStashXCTest.swift; sourceTree = "<group>"; };
@@ -159,6 +161,7 @@
 				B22 /* ScreenshotCoordinator.swift */,
 				B23 /* DebugScreenshotStressHarness.swift */,
 				B24 /* ClipboardPasteboardHelperClient.swift */,
+				B25 /* TerminationDeadlineCoordinator.swift */,
 				B9 /* Info.plist */,
 			);
 			path = QuickStash;
@@ -330,6 +333,7 @@
 				A21 /* ScreenshotCoordinator.swift in Sources */,
 				A22 /* DebugScreenshotStressHarness.swift in Sources */,
 				A23 /* ClipboardPasteboardHelperClient.swift in Sources */,
+				A24 /* TerminationDeadlineCoordinator.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -373,7 +377,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
 				INFOPLIST_FILE = QuickStash/Info.plist;
@@ -402,7 +406,7 @@
 				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_CODE_COVERAGE = NO;
 				ENABLE_DEBUG_DYLIB = NO;
@@ -540,7 +544,7 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.1.0;
@@ -560,7 +564,7 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.1.0;
@@ -580,7 +584,7 @@
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
@@ -602,7 +606,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_CODE_COVERAGE = NO;
 				ENABLE_DEBUG_DYLIB = NO;

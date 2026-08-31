@@ -91,6 +91,7 @@ private final class FakeClipboardPasteboard: ClipboardPasteboard, @unchecked Sen
     private var storedTIFFData: Data?
     private var storedText: String?
     private var storedPayloadReadCount = 0
+    private var storedPayloadReadCompletionCount = 0
     private var storedEmptyReadsRemaining = 0
     private var activeReaders = 0
     private var storedMaximumConcurrentReaders = 0
@@ -120,6 +121,9 @@ private final class FakeClipboardPasteboard: ClipboardPasteboard, @unchecked Sen
     }
 
     @MainActor var payloadReadCount: Int { lock.withLock { storedPayloadReadCount } }
+    @MainActor var payloadReadCompletionCount: Int {
+        lock.withLock { storedPayloadReadCompletionCount }
+    }
     @MainActor var emptyReadsRemaining: Int {
         get { lock.withLock { storedEmptyReadsRemaining } }
         set { lock.withLock { storedEmptyReadsRemaining = max(0, newValue) } }
@@ -146,7 +150,10 @@ private final class FakeClipboardPasteboard: ClipboardPasteboard, @unchecked Sen
         readStarted.signal()
         gate?.wait()
         return lock.withLock {
-            defer { activeReaders -= 1 }
+            defer {
+                activeReaders -= 1
+                storedPayloadReadCompletionCount += 1
+            }
             if let forcedSnapshot {
                 return forcedSnapshot
             }
@@ -170,6 +177,60 @@ private final class FakeClipboardPasteboard: ClipboardPasteboard, @unchecked Sen
             return ClipboardPayloadSnapshot(changeCount: storedChangeCount, payload: payload)
         }
     }
+}
+
+@MainActor
+private final class BlockingDuplicateImagePromoter {
+    private(set) var observedDates: [Date] = []
+    private(set) var fingerprints: [String] = []
+    private var firstContinuation: CheckedContinuation<Void, Never>?
+
+    var firstCallIsBlocked: Bool { firstContinuation != nil }
+
+    func promote(fingerprint: String, observedAt: Date) async -> Bool {
+        fingerprints.append(fingerprint)
+        observedDates.append(observedAt)
+        if observedDates.count == 1 {
+            await withCheckedContinuation { continuation in
+                firstContinuation = continuation
+            }
+        }
+        return true
+    }
+
+    func releaseFirstCall() {
+        let continuation = firstContinuation
+        firstContinuation = nil
+        continuation?.resume()
+    }
+}
+
+@MainActor
+private final class AsyncValidityGate {
+    var isValid = true
+    private(set) var checkCount = 0
+
+    func check() -> Bool {
+        checkCount += 1
+        return isValid
+    }
+}
+
+@MainActor
+private final class ClipboardImageReservationRecorder {
+    private(set) var events: [ClipboardImageReservationEvent] = []
+
+    func record(_ event: ClipboardImageReservationEvent) {
+        events.append(event)
+    }
+}
+
+private final class LockedInvocationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = 0
+
+    var value: Int { lock.withLock { storedValue } }
+    func increment() { lock.withLock { storedValue += 1 } }
 }
 
 private final class SlowPNGDataProvider: NSObject, NSPasteboardItemDataProvider, @unchecked Sendable {
@@ -258,6 +319,48 @@ private final class AlwaysFailClipboardImageSaver: @unchecked Sendable {
     func save() async throws -> StashItem {
         lock.withLock { storedCallCount += 1 }
         throw CocoaError(.fileWriteUnknown)
+    }
+}
+
+private actor BlockingClipboardImageReader {
+    private let payload: ClipboardImagePayload
+    private var continuation: CheckedContinuation<ClipboardImagePayload, Never>?
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var hasStarted = false
+    private var observedCancellation = false
+
+    init(payload: ClipboardImagePayload) {
+        self.payload = payload
+    }
+
+    func read(_ path: String) async throws -> ClipboardImagePayload {
+        hasStarted = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+
+        let result = await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+        observedCancellation = Task.isCancelled
+        return result
+    }
+
+    func waitUntilStarted() async {
+        guard !hasStarted else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func finish() {
+        let continuation = continuation
+        self.continuation = nil
+        continuation?.resume(returning: payload)
+    }
+
+    func wasCancelledBeforeCompletion() -> Bool {
+        observedCancellation
     }
 }
 
@@ -389,6 +492,10 @@ struct QuickStashViewModelTests {
         try await testCancelledRetryKeepsOriginalImportError(in: root)
         try await testProgressCoalescesToOnePublishedMutation(in: root)
         try await testBootstrapMergesInputWithoutWritingEmptyState(in: root)
+        try await testBootstrapDuplicateAliasReplaysDelete(in: root)
+        try await testBootstrapDuplicateAliasResolvesTogglePin(in: root)
+        try await testBootstrapDuplicateAliasCompletesAsyncImageCopy(in: root)
+        try await testBootstrapReplacesCorruptClipboardCanonicalAfterMetadataFlush(in: root)
         try await testRecoveryJobsCannotBeDismissedOrTrimmed(in: root)
         try await testStorageRetryClearsOwnedErrorAndAcknowledgesManifest(in: root)
         try await testResolvedCleanupJobIsRemovedAfterBootstrap(in: root)
@@ -397,6 +504,7 @@ struct QuickStashViewModelTests {
         try await testInternalWriteReceiptDoesNotSuppressExternalCopy()
         try await testClipboardTimerCapturesTextLinkAndImage()
         try testSystemClipboardNormalizesImageFormatsAndFallback()
+        try testAutoGeneratedClipboardImageIsCapturedAsPNG()
         try await testClipboardHelperForceKillsBlockedProcessAtTimeout()
         try await testClipboardHelperSelfWatchdogTerminatesBlockedProvider()
         try await testSystemClipboardHelperTimesOutBlockedFlavorAndUsesFallback()
@@ -409,6 +517,10 @@ struct QuickStashViewModelTests {
         try await testCompletedTextSurvivesNewerClipboardCount(in: root)
         try await testProvisionalTextFinalizesBeforeNextCopy(in: root)
         try await testPreparedClipboardImageTransaction()
+        try await testPreparedClipboardImageRejectsInvalidatedPromotion()
+        try await testPreparedClipboardImageSaveCannotOutliveShutdown(in: root)
+        try await testPreparedClipboardImageRevalidatesCanonical(in: root)
+        try await testDuplicateImagePromotionChecksValidityAfterFileIO(in: root)
         try await testClipboardImageSurvivesLaterText(in: root)
         try await testClipboardStopRejectsLateRead()
         try await testClipboardAcceptsLateImageAfterSoftTimeout()
@@ -423,16 +535,541 @@ struct QuickStashViewModelTests {
         try await testClipboardReaderIsSerialAndDoesNotBlockMainActor()
         try await testClipboardShutdownDrainsImageSave(in: root)
         try await testClipboardGracefulTerminationPersistsFinalTextAndURL(in: root)
+        try await testClipboardGracefulTerminationDrainsLastSlowRead()
+        try await testClipboardGracefulTerminationTimesOutBlockedRead()
         try await testClipboardGracefulTerminationDrainsImageSave(in: root)
         try await testPendingImageIsDiscardedAfterDisableAndClear(in: root)
         try testClipboardRetentionPlanner()
         try await testClipboardRetentionTimer()
         try await testPinIsRejectedDuringClipboardCleanup(in: root)
+        try await testTerminationWaitsForManualClipboardClear(in: root)
+        try await testManualDeletePreservesConcurrentDuplicateImage(in: root)
         try await testClipboardImageOrphanRecoveryRetentionClearAndRestart(in: root)
         try await testClipboardStorageAndLegacyRepublishUsePNG(in: root)
+        try await testClipboardDuplicateTextAndURLPromotion(in: root)
+        try await testClipboardInternalCopyPromotesOnlyAfterSuccess(in: root)
+        try testClipboardImageFingerprintsUseDecodedPixels()
+        try await testClipboardDuplicateImageKeepsCanonicalBacking(in: root)
+        try await testClipboardAsyncImageCopyRejectsStaleCompletion(in: root)
+        try await testClipboardImageCopyClaimBlocksCleanup(in: root)
+        try await testClipboardDuplicateImagePromotionCoalescesWhileBlocked()
+        try await testClipboardDuplicateTextURLPromotionStress(in: root)
         try await testPartialClipboardClear(in: root)
 
         print("QuickStash view-model tests passed")
+    }
+
+    @MainActor
+    private static func testClipboardDuplicateTextAndURLPromotion(in root: URL) async throws {
+        let base = root.appendingPathComponent("clipboard-duplicate-text-url", isDirectory: true)
+        let viewModel = StashViewModel(
+            storageManager: StorageManager(baseDirectory: base.appendingPathComponent("metadata")),
+            fileManager: QuickStashFileManager(baseDirectory: base.appendingPathComponent("files")),
+            loadOnInit: false,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {}
+        )
+        let start = Date(timeIntervalSince1970: 10_000)
+        let textID = UUID()
+        let textA = StashItem(
+            id: textID,
+            type: .text,
+            content: "alpha",
+            preview: "alpha",
+            createdAt: start,
+            isPinned: true,
+            managedOrigin: .clipboard
+        )
+        viewModel.addItem(textA)
+        viewModel.addItem(StashItem(
+            type: .text,
+            content: "beta",
+            preview: "beta",
+            createdAt: start.addingTimeInterval(1),
+            managedOrigin: .clipboard
+        ))
+        viewModel.addItem(StashItem(
+            type: .text,
+            content: "alpha",
+            preview: "replacement",
+            createdAt: start.addingTimeInterval(2),
+            managedOrigin: .clipboard
+        ))
+        try expect(viewModel.items.count == 2, "Text A-B-A created a duplicate record")
+        try expect(viewModel.items[0].id == textID, "Text A-B-A did not promote the original record")
+        try expect(viewModel.items[0].isPinned, "Text A-B-A lost the original pin")
+
+        let urlID = UUID()
+        viewModel.addItem(StashItem(
+            id: urlID,
+            type: .url,
+            content: "https://example.com/a",
+            preview: "a",
+            createdAt: start.addingTimeInterval(3),
+            isPinned: true,
+            managedOrigin: .clipboard
+        ))
+        viewModel.addItem(StashItem(
+            type: .url,
+            content: "https://example.com/b",
+            preview: "b",
+            createdAt: start.addingTimeInterval(4),
+            managedOrigin: .clipboard
+        ))
+        viewModel.addItem(StashItem(
+            type: .url,
+            content: "https://example.com/a",
+            preview: "replacement",
+            createdAt: start.addingTimeInterval(5),
+            managedOrigin: .clipboard
+        ))
+        try expect(viewModel.items[0].id == urlID, "URL A-B-A did not promote the original record")
+        try expect(viewModel.items[0].isPinned, "URL A-B-A lost the original pin")
+        try expect(viewModel.items.filter { $0.content == "https://example.com/a" }.count == 1, "URL A-B-A created a duplicate record")
+
+        viewModel.addItem(StashItem(
+            type: .url,
+            content: "https://example.com/a",
+            preview: "imported",
+            createdAt: start.addingTimeInterval(6),
+            managedOrigin: .imported
+        ))
+        try expect(
+            viewModel.items.filter { $0.content == "https://example.com/a" }.count == 2,
+            "Clipboard duplicate matching crossed origin boundaries"
+        )
+    }
+
+    @MainActor
+    private static func testClipboardInternalCopyPromotesOnlyAfterSuccess(in root: URL) async throws {
+        let base = root.appendingPathComponent("clipboard-copy-promotion", isDirectory: true)
+        var shouldWrite = false
+        let viewModel = StashViewModel(
+            storageManager: StorageManager(baseDirectory: base.appendingPathComponent("metadata")),
+            fileManager: QuickStashFileManager(baseDirectory: base.appendingPathComponent("files")),
+            loadOnInit: false,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {},
+            clipboardTextWriter: { _ in shouldWrite }
+        )
+        let start = Date(timeIntervalSince1970: 20_000)
+        let first = StashItem(type: .text, content: "first", preview: "first", createdAt: start, isPinned: true, managedOrigin: .clipboard)
+        let second = StashItem(type: .text, content: "second", preview: "second", createdAt: start.addingTimeInterval(1), managedOrigin: .clipboard)
+        viewModel.addItem(first)
+        viewModel.addItem(second)
+
+        viewModel.copyToClipboard(first)
+        try expect(viewModel.items[0].id == second.id, "Failed internal write promoted clipboard history")
+        try expect(viewModel.lastError != nil, "Failed internal write did not report an error")
+
+        shouldWrite = true
+        viewModel.copyToClipboard(first)
+        try expect(viewModel.items[0].id == first.id, "Successful internal write did not promote clipboard history")
+        try expect(viewModel.items[0].isPinned, "Internal-copy promotion lost the original pin")
+    }
+
+    @MainActor
+    private static func testClipboardImageFingerprintsUseDecodedPixels() throws {
+        let png = try makeBitmapImageData(width: 32, height: 24, fileType: .png, isOpaque: true)
+        let tiff = try makeBitmapImageData(width: 32, height: 24, fileType: .tiff, isOpaque: true)
+        let different = try makeBitmapImageData(width: 33, height: 24, fileType: .png, isOpaque: true)
+        let pngFingerprint = try ClipboardPNGEncoder.fingerprint(from: png)
+        let tiffFingerprint = try ClipboardPNGEncoder.fingerprint(from: tiff)
+        let differentFingerprint = try ClipboardPNGEncoder.fingerprint(from: different)
+        try expect(
+            pngFingerprint == tiffFingerprint,
+            "Same-pixel PNG and TIFF produced different fingerprints"
+        )
+        try expect(
+            pngFingerprint != differentFingerprint,
+            "Different image pixels produced the same fingerprint"
+        )
+    }
+
+    @MainActor
+    private static func testClipboardDuplicateImageKeepsCanonicalBacking(in root: URL) async throws {
+        let base = root.appendingPathComponent("clipboard-image-dedup", isDirectory: true)
+        let quarantineFailure = FailSelectedQuarantine()
+        let fileManager = QuickStashFileManager(
+            baseDirectory: base.appendingPathComponent("files"),
+            cleanupFaultInjector: { try quarantineFailure.inject($0) }
+        )
+        let viewModel = StashViewModel(
+            storageManager: StorageManager(baseDirectory: base.appendingPathComponent("metadata")),
+            fileManager: fileManager,
+            loadOnInit: false,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {}
+        )
+        let pixels = try makeBitmapImageData(width: 48, height: 36, fileType: .png)
+        let canonical = try await fileManager.saveClipboardImage(data: pixels, fileExtension: "png")
+        var pinnedCanonical = canonical
+        pinnedCanonical.isPinned = true
+        viewModel.addItem(pinnedCanonical)
+        let duplicate = try await fileManager.saveClipboardImage(data: pixels, fileExtension: "png")
+        viewModel.addItem(duplicate)
+
+        try expect(viewModel.items.count == 1, "Same-pixel image created a duplicate history record")
+        try expect(viewModel.items[0].id == canonical.id, "Duplicate image replaced the canonical ID")
+        try expect(viewModel.items[0].content == canonical.content, "Duplicate image replaced the canonical backing path")
+        try expect(viewModel.items[0].isPinned, "Duplicate image lost the canonical pin")
+        try await waitUntil(description: "duplicate image backing deletion") {
+            !FileManager.default.fileExists(atPath: duplicate.content)
+        }
+        try expect(FileManager.default.fileExists(atPath: canonical.content), "Duplicate cleanup deleted the canonical image")
+
+        let differentPixels = try makeBitmapImageData(width: 49, height: 36, fileType: .png)
+        let different = try await fileManager.saveClipboardImage(data: differentPixels, fileExtension: "png")
+        viewModel.addItem(different)
+        try expect(viewModel.items.count == 2, "Different image pixels were incorrectly deduplicated")
+
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(
+            to: URL(fileURLWithPath: canonical.content),
+            options: .atomic
+        )
+        let promotedCorrupt = await viewModel.promoteDuplicateClipboardImage(
+            fingerprint: canonical.contentFingerprint ?? "",
+            observedAt: Date()
+        )
+        try expect(!promotedCorrupt, "Corrupt canonical image was incorrectly considered reusable")
+        try expect(
+            viewModel.items.first(where: { $0.id == canonical.id })?.availability == .unavailable,
+            "Corrupt canonical image was not marked unavailable"
+        )
+
+        let replacement = try await fileManager.saveClipboardImage(data: pixels, fileExtension: "png")
+        quarantineFailure.select(URL(fileURLWithPath: canonical.content))
+        viewModel.addItem(replacement)
+        try await waitUntil(description: "valid replacement backing commit") {
+            viewModel.items.contains(where: {
+                $0.id == canonical.id && $0.content == replacement.content
+            })
+        }
+        guard let repaired = viewModel.items.first(where: { $0.id == canonical.id }) else {
+            throw ViewModelTestFailure.assertion("Replacement image lost the canonical history ID")
+        }
+        try expect(repaired.content == replacement.content, "Valid replacement did not take over the corrupt backing path")
+        try expect(repaired.availability == .available, "Valid replacement remained unavailable")
+        try expect(repaired.isPinned, "Valid replacement lost the canonical pin")
+        try await waitUntil(description: "replaced corrupt backing deletion") {
+            !FileManager.default.fileExists(atPath: canonical.content)
+        }
+        let replacementIsReusable = await fileManager.isReusableClipboardImage(
+            at: repaired.content,
+            matching: repaired.contentFingerprint ?? ""
+        )
+        try expect(
+            replacementIsReusable,
+            "Replacement backing did not pass decoded fingerprint validation"
+        )
+    }
+
+    @MainActor
+    private static func testClipboardAsyncImageCopyRejectsStaleCompletion(in root: URL) async throws {
+        let base = root.appendingPathComponent("clipboard-stale-image-copy", isDirectory: true)
+        let fileManager = QuickStashFileManager(baseDirectory: base.appendingPathComponent("files"))
+        let image = try await fileManager.saveClipboardImage(
+            data: try makeBitmapImageData(width: 40, height: 30, fileType: .png),
+            fileExtension: "png"
+        )
+        let imageReader = BlockingClipboardImageReader(
+            payload: try await fileManager.readManagedImage(at: image.content)
+        )
+        var imageWriteCount = 0
+        let viewModel = StashViewModel(
+            storageManager: StorageManager(baseDirectory: base.appendingPathComponent("metadata")),
+            fileManager: fileManager,
+            loadOnInit: false,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {},
+            clipboardTextWriter: { _ in true },
+            clipboardImageReader: { path in
+                try await imageReader.read(path)
+            },
+            clipboardImageWriter: { _ in
+                imageWriteCount += 1
+                return true
+            }
+        )
+        let text = StashItem(type: .text, content: "newer", preview: "newer", managedOrigin: .clipboard)
+        viewModel.addItem(image)
+        viewModel.addItem(text)
+        viewModel.copyToClipboard(image)
+        await imageReader.waitUntilStarted()
+        viewModel.copyToClipboard(text)
+        await imageReader.finish()
+        await viewModel.flushForTermination()
+
+        let imageReadWasCancelled = await imageReader.wasCancelledBeforeCompletion()
+        try expect(
+            imageReadWasCancelled,
+            "Newer clipboard copy did not cancel the pending image read"
+        )
+        try expect(imageWriteCount == 0, "Stale async image copy wrote over the newer clipboard value")
+        try expect(viewModel.items[0].id == text.id, "Stale async image copy promoted old history")
+    }
+
+    @MainActor
+    private static func testClipboardImageCopyClaimBlocksCleanup(in root: URL) async throws {
+        let base = root.appendingPathComponent("clipboard-image-copy-claim", isDirectory: true)
+        let fileManager = QuickStashFileManager(baseDirectory: base.appendingPathComponent("files"))
+        let image = try await fileManager.saveClipboardImage(
+            data: try makeBitmapImageData(width: 44, height: 33, fileType: .png),
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 60_000)
+        )
+        let imageReader = BlockingClipboardImageReader(
+            payload: try await fileManager.readManagedImage(at: image.content)
+        )
+        var imageWriteCount = 0
+        let viewModel = StashViewModel(
+            storageManager: StorageManager(baseDirectory: base.appendingPathComponent("metadata")),
+            fileManager: fileManager,
+            loadOnInit: false,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {},
+            clipboardImageReader: { path in try await imageReader.read(path) },
+            clipboardImageWriter: { _ in
+                imageWriteCount += 1
+                return true
+            }
+        )
+        let newerText = StashItem(
+            type: .text,
+            content: "newer-than-image",
+            preview: "newer-than-image",
+            createdAt: Date(timeIntervalSince1970: 60_001),
+            managedOrigin: .clipboard
+        )
+        viewModel.addItem(image)
+        viewModel.addItem(newerText)
+        viewModel.copyToClipboard(image)
+        await imageReader.waitUntilStarted()
+
+        viewModel.deleteItem(image)
+        try expect(
+            viewModel.lastError == "该记录正在复制，暂时无法删除",
+            "Manual delete was not rejected while an image copy was in flight"
+        )
+        viewModel.updateClipboardRetentionPolicy(
+            ClipboardRetentionPolicy(maximumItemCount: 1, maximumAgeDays: nil)
+        )
+        try expect(viewModel.items.count == 2, "Retention removed an actively copied image")
+        try expect(FileManager.default.fileExists(atPath: image.content), "Active copy backing was quarantined")
+
+        await imageReader.finish()
+        try await waitUntil(description: "successful claimed image copy") {
+            imageWriteCount == 1
+                && viewModel.items.count == 1
+                && viewModel.items.first?.id == image.id
+        }
+        try expect(viewModel.items[0].createdAt > newerText.createdAt, "Claimed image copy was not promoted")
+        try expect(FileManager.default.fileExists(atPath: image.content), "Promoted image backing was removed")
+        await viewModel.flushForTermination()
+    }
+
+    @MainActor
+    private static func testClipboardDuplicateImagePromotionCoalescesWhileBlocked() async throws {
+        let suite = "QuickStashTests.clipboard.image-coalesce.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create duplicate-image defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let pasteboard = FakeClipboardPasteboard()
+        let promoter = BlockingDuplicateImagePromoter()
+        let reservations = ClipboardImageReservationRecorder()
+        let saveCounter = LockedInvocationCounter()
+        let newItemCounter = LockedInvocationCounter()
+        pasteboard.changeCount = 4_000
+        pasteboard.pngData = Data([0x89, 0x50, 0x4E, 0x47])
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: pasteboard,
+            imageSaver: { _, _, _ in
+                saveCounter.increment()
+                throw CocoaError(.fileWriteUnknown)
+            },
+            imageFingerprinter: { _ in "same-fingerprint" },
+            imageReservationObserver: { event in reservations.record(event) }
+        )
+        monitor.onPromoteDuplicateImage = { fingerprint, observedAt, isStillValid in
+            let promoted = await promoter.promote(fingerprint: fingerprint, observedAt: observedAt)
+            return isStillValid() && promoted
+        }
+        monitor.onNewItem = { _ in newItemCounter.increment() }
+        monitor.setConsent(.enabled)
+
+        let firstObservedAt = Date(timeIntervalSince1970: 40_001)
+        let secondObservedAt = Date(timeIntervalSince1970: 40_002)
+        let thirdObservedAt = Date(timeIntervalSince1970: 40_003)
+        pasteboard.changeCount = 4_001
+        monitor.checkClipboard(observedAt: firstObservedAt)
+        try await waitUntil(description: "first duplicate promotion blocked") {
+            promoter.firstCallIsBlocked
+                && reservations.events == [
+                    .reserved(fingerprint: "same-fingerprint", changeCount: 4_001)
+                ]
+        }
+
+        pasteboard.changeCount = 4_002
+        monitor.checkClipboard(observedAt: secondObservedAt)
+        try await waitUntil(description: "second duplicate image reservation") {
+            reservations.events == [
+                .reserved(fingerprint: "same-fingerprint", changeCount: 4_001),
+                .coalesced(fingerprint: "same-fingerprint", changeCount: 4_002)
+            ]
+        }
+        pasteboard.changeCount = 4_003
+        monitor.checkClipboard(observedAt: thirdObservedAt)
+        try await waitUntil(description: "all duplicate image reservations") {
+            reservations.events == [
+                .reserved(fingerprint: "same-fingerprint", changeCount: 4_001),
+                .coalesced(fingerprint: "same-fingerprint", changeCount: 4_002),
+                .coalesced(fingerprint: "same-fingerprint", changeCount: 4_003)
+            ]
+        }
+        try expect(promoter.observedDates.count == 1, "Concurrent duplicate images bypassed the blocked promotion")
+
+        promoter.releaseFirstCall()
+        try await waitUntil(description: "coalesced duplicate promotion completion") {
+            reservations.events.last == .released(fingerprint: "same-fingerprint")
+        }
+        try expect(
+            promoter.observedDates == [firstObservedAt, thirdObservedAt],
+            "Coalesced promotion did not use the latest observed time"
+        )
+        try expect(
+            promoter.fingerprints == ["same-fingerprint", "same-fingerprint"],
+            "Promoter received an unexpected image fingerprint"
+        )
+        try expect(promoter.observedDates.count == 2, "Duplicate image requests were not coalesced")
+        try expect(saveCounter.value == 0, "Promoted duplicate image unexpectedly invoked imageSaver")
+        try expect(newItemCounter.value == 0, "Promoted duplicate image unexpectedly emitted onNewItem")
+
+        await monitor.shutdownAndDrain()
+        try expect(saveCounter.value == 0, "Shutdown restarted a coalesced image save")
+
+        let shutdownPasteboard = FakeClipboardPasteboard()
+        let shutdownPromoter = BlockingDuplicateImagePromoter()
+        let shutdownReservations = ClipboardImageReservationRecorder()
+        let shutdownSaveCounter = LockedInvocationCounter()
+        let shutdownNewItemCounter = LockedInvocationCounter()
+        shutdownPasteboard.changeCount = 5_000
+        shutdownPasteboard.pngData = Data([0x89, 0x50, 0x4E, 0x47])
+        let shutdownMonitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: shutdownPasteboard,
+            imageSaver: { _, _, _ in
+                shutdownSaveCounter.increment()
+                throw CocoaError(.fileWriteUnknown)
+            },
+            imageFingerprinter: { _ in "shutdown-fingerprint" },
+            imageReservationObserver: { event in shutdownReservations.record(event) }
+        )
+        shutdownMonitor.onPromoteDuplicateImage = { fingerprint, observedAt, isStillValid in
+            let promoted = await shutdownPromoter.promote(fingerprint: fingerprint, observedAt: observedAt)
+            return isStillValid() && promoted
+        }
+        shutdownMonitor.onNewItem = { _ in shutdownNewItemCounter.increment() }
+        shutdownMonitor.setConsent(.enabled)
+
+        shutdownPasteboard.changeCount = 5_001
+        shutdownMonitor.checkClipboard(observedAt: Date(timeIntervalSince1970: 50_001))
+        try await waitUntil(description: "shutdown duplicate promotion blocked") {
+            shutdownPromoter.firstCallIsBlocked
+                && shutdownReservations.events == [
+                    .reserved(fingerprint: "shutdown-fingerprint", changeCount: 5_001)
+                ]
+        }
+
+        let shutdownTask = Task { await shutdownMonitor.shutdownAndDrain() }
+        try await waitUntil(description: "shutdown reservation invalidation") {
+            shutdownReservations.events.last == .released(fingerprint: "shutdown-fingerprint")
+        }
+        try expect(shutdownPromoter.firstCallIsBlocked, "Shutdown test released the promoter prematurely")
+        shutdownPromoter.releaseFirstCall()
+        await shutdownTask.value
+
+        try expect(shutdownSaveCounter.value == 0, "Shutdown allowed a blocked duplicate image save")
+        try expect(shutdownNewItemCounter.value == 0, "Shutdown published a blocked duplicate image")
+        try expect(
+            shutdownReservations.events == [
+                .reserved(fingerprint: "shutdown-fingerprint", changeCount: 5_001),
+                .released(fingerprint: "shutdown-fingerprint")
+            ],
+            "Shutdown left or recreated a duplicate-image reservation"
+        )
+    }
+
+    @MainActor
+    private static func testClipboardDuplicateTextURLPromotionStress(in root: URL) async throws {
+        let base = root.appendingPathComponent("clipboard-duplicate-text-url-stress", isDirectory: true)
+        let viewModel = StashViewModel(
+            storageManager: StorageManager(baseDirectory: base.appendingPathComponent("metadata")),
+            fileManager: QuickStashFileManager(baseDirectory: base.appendingPathComponent("files")),
+            loadOnInit: false,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {},
+            clipboardTextWriter: { _ in true }
+        )
+        let textID = UUID()
+        let urlID = UUID()
+        let text = StashItem(
+            id: textID,
+            type: .text,
+            content: "stress-text",
+            preview: "stress-text",
+            createdAt: Date(timeIntervalSince1970: 30_000),
+            isPinned: true,
+            managedOrigin: .clipboard
+        )
+        let url = StashItem(
+            id: urlID,
+            type: .url,
+            content: "https://example.com/stress",
+            preview: "stress-url",
+            createdAt: Date(timeIntervalSince1970: 30_001),
+            isPinned: true,
+            managedOrigin: .clipboard
+        )
+        viewModel.addItem(text)
+        viewModel.addItem(url)
+
+        for iteration in 0..<100 {
+            let canonical = iteration.isMultiple(of: 2) ? text : url
+            viewModel.addItem(StashItem(
+                type: canonical.type,
+                content: canonical.content,
+                preview: "duplicate-\(iteration)",
+                createdAt: Date(timeIntervalSince1970: 31_000 + Double(iteration)),
+                managedOrigin: .clipboard
+            ))
+            guard let retained = viewModel.items.first(where: { $0.content == canonical.content }) else {
+                throw ViewModelTestFailure.assertion("Stress promotion lost \(canonical.content)")
+            }
+            viewModel.copyToClipboard(retained)
+            guard let promoted = viewModel.items.first(where: { $0.id == canonical.id }) else {
+                throw ViewModelTestFailure.assertion("Stress promotion lost the canonical item")
+            }
+            try expect(
+                viewModel.items.filter { $0.type == canonical.type && $0.content == canonical.content }.count == 1,
+                "Stress promotion duplicated \(canonical.type.rawValue) at iteration \(iteration)"
+            )
+            try expect(retained.id == canonical.id, "Stress promotion replaced the original ID")
+            try expect(promoted.isPinned, "Stress promotion lost the original pin")
+            try expect(viewModel.items[0].id == canonical.id, "Stress promotion produced the wrong front item")
+        }
+
+        try expect(viewModel.items.count == 2, "Stress promotion changed the number of clipboard records")
+        try expect(viewModel.items[0].id == urlID, "Final stress ordering did not reflect the last URL promotion")
+        try expect(viewModel.items[1].id == textID, "Final stress ordering changed the text record")
     }
 
     private static func testClipboardHelperForceKillsBlockedProcessAtTimeout() async throws {
@@ -504,7 +1141,8 @@ struct QuickStashViewModelTests {
     private static func makeBitmapImageData(
         width: Int = 64,
         height: Int = 48,
-        fileType: NSBitmapImageRep.FileType
+        fileType: NSBitmapImageRep.FileType,
+        isOpaque: Bool = false
     ) throws -> Data {
         guard let bitmap = NSBitmapImageRep(
             bitmapDataPlanes: nil,
@@ -526,7 +1164,7 @@ struct QuickStashViewModelTests {
                 bytes[offset] = UInt8((x * 3) % 255)
                 bytes[offset + 1] = UInt8((y * 5) % 255)
                 bytes[offset + 2] = 160
-                bytes[offset + 3] = UInt8(128 + ((x + y) % 127))
+                bytes[offset + 3] = isOpaque ? 255 : UInt8(128 + ((x + y) % 127))
             }
         }
         let properties: [NSBitmapImageRep.PropertyKey: Any] = fileType == .jpeg
@@ -1013,6 +1651,33 @@ struct QuickStashViewModelTests {
               delayedText == "same-count delayed text" else {
             throw ViewModelTestFailure.assertion("Invalid image permanently suppressed its delayed text fallback")
         }
+    }
+
+    @MainActor
+    private static func testAutoGeneratedClipboardImageIsCapturedAsPNG() throws {
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        let sourceTIFF = try makeBitmapImageData(width: 91, height: 57, fileType: .tiff)
+        let autoGeneratedType = NSPasteboard.PasteboardType("org.nspasteboard.AutoGeneratedType")
+        _ = pasteboard.declareTypes([.tiff, autoGeneratedType], owner: nil)
+        try expect(pasteboard.setData(sourceTIFF, forType: .tiff), "Named pasteboard rejected TIFF fixture")
+        try expect(
+            pasteboard.setData(Data(), forType: autoGeneratedType),
+            "Named pasteboard rejected auto-generated marker"
+        )
+
+        let snapshot = SystemClipboardPasteboard(pasteboard: pasteboard).readPayloadSnapshot(
+            maximumImageBytes: ClipboardPNGEncoder.maximumOutputBytes,
+            maximumTextCharacters: 1_024
+        )
+        guard let snapshot,
+              case .image(let normalizedData, let fileExtension) = snapshot.payload else {
+            throw ViewModelTestFailure.assertion(
+                "Auto-generated marker incorrectly suppressed a valid clipboard image"
+            )
+        }
+        try expect(fileExtension == "png", "Auto-generated clipboard image did not use PNG storage")
+        try expect(isPNG(normalizedData), "Auto-generated clipboard image bytes were not PNG")
     }
 
     @MainActor
@@ -1616,8 +2281,10 @@ struct QuickStashViewModelTests {
             observedAt: observedAt
         )
         try expect(received.isEmpty, "Prepared screenshot image was published before clipboard write")
-        try expect(monitor.commitPreparedImageRecord(prepared), "Prepared screenshot image did not commit")
-        try expect(!monitor.commitPreparedImageRecord(prepared), "Prepared screenshot image committed twice")
+        let preparedDidCommit = await monitor.commitPreparedImageRecord(prepared)
+        let preparedDidCommitAgain = await monitor.commitPreparedImageRecord(prepared)
+        try expect(preparedDidCommit, "Prepared screenshot image did not commit")
+        try expect(!preparedDidCommitAgain, "Prepared screenshot image committed twice")
         try expect(received.count == 1, "Prepared screenshot image was not recorded exactly once")
         try expect(received[0].managedOrigin == .clipboard, "Prepared screenshot image origin changed")
         try expect(received[0].createdAt == observedAt, "Prepared screenshot image lost its copy time")
@@ -1625,12 +2292,260 @@ struct QuickStashViewModelTests {
         let abandoned = try await monitor.prepareImageRecord(data: Data([6, 5, 4]))
         await monitor.discardPreparedImageRecord(abandoned)
         try expect(discarder.count == 1, "Abandoned screenshot history file was not discarded")
-        try expect(!monitor.commitPreparedImageRecord(abandoned), "Discarded screenshot history item committed late")
+        let abandonedDidCommit = await monitor.commitPreparedImageRecord(abandoned)
+        try expect(!abandonedDidCommit, "Discarded screenshot history item committed late")
 
         let pendingAtShutdown = try await monitor.prepareImageRecord(data: Data([3, 2, 1]))
         await monitor.shutdownAndDrain()
         try expect(discarder.count == 2, "Shutdown did not discard an uncommitted screenshot history image")
-        try expect(!monitor.commitPreparedImageRecord(pendingAtShutdown), "Shutdown image committed after cleanup")
+        let shutdownImageDidCommit = await monitor.commitPreparedImageRecord(pendingAtShutdown)
+        try expect(!shutdownImageDidCommit, "Shutdown image committed after cleanup")
+    }
+
+    @MainActor
+    private static func testPreparedClipboardImageRejectsInvalidatedPromotion() async throws {
+        let suite = "QuickStashTests.clipboard.prepared-invalidated.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create invalidated prepared-image defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let discarder = ImageDiscardRecorder()
+        let promoter = BlockingDuplicateImagePromoter()
+        let validity = AsyncValidityGate()
+        var received: [StashItem] = []
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: FakeClipboardPasteboard(),
+            imageSaver: { _, _, observedAt in
+                StashItem(
+                    type: .image,
+                    content: "/tmp/prepared-invalidated-\(UUID().uuidString).png",
+                    preview: "invalidated prepared image",
+                    createdAt: observedAt,
+                    managedOrigin: .clipboard,
+                    contentFingerprint: "prepared-invalidated-fingerprint"
+                )
+            },
+            imageDiscarder: { await discarder.discard($0) }
+        )
+        monitor.onPromoteDuplicateImage = { fingerprint, observedAt, isStillValid in
+            let promoted = await promoter.promote(
+                fingerprint: fingerprint,
+                observedAt: observedAt
+            )
+            return isStillValid() && promoted
+        }
+        monitor.onNewItem = { received.append($0) }
+
+        let prepared = try await monitor.prepareImageRecord(data: Data([4, 5, 6]))
+        let commit = Task {
+            await monitor.commitPreparedImageRecord(
+                prepared,
+                isStillValid: { validity.check() }
+            )
+        }
+        try await waitUntil(description: "prepared image promotion blocked") {
+            promoter.firstCallIsBlocked
+        }
+
+        validity.isValid = false
+        promoter.releaseFirstCall()
+        let didCommit = await commit.value
+
+        try expect(!didCommit, "Invalidated prepared image committed late")
+        try expect(received.isEmpty, "Invalidated prepared image polluted clipboard history")
+        try expect(discarder.count == 1, "Invalidated prepared image backing was not discarded")
+        await monitor.shutdownAndDrain()
+        try expect(discarder.count == 1, "Invalidated prepared image was discarded more than once")
+    }
+
+    @MainActor
+    private static func testPreparedClipboardImageSaveCannotOutliveShutdown(
+        in root: URL
+    ) async throws {
+        let suite = "QuickStashTests.clipboard.prepared-shutdown.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create prepared shutdown defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let destination = root.appendingPathComponent("prepared-shutdown-late.png")
+        let saver = BlockingImageSaveScript(destination: destination)
+        let discarder = ImageDiscardRecorder()
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: FakeClipboardPasteboard(),
+            imageSaver: { _, _, observedAt in await saver.save(observedAt: observedAt) },
+            imageDiscarder: { await discarder.discard($0) }
+        )
+
+        let preparation = Task {
+            try await monitor.prepareImageRecord(data: Data([7, 7, 7]))
+        }
+        try await waitUntil(description: "prepared image save blocked") { saver.started }
+
+        var shutdownFinished = false
+        let shutdown = Task {
+            await monitor.shutdownAndDrain()
+            shutdownFinished = true
+        }
+        await Task.yield()
+        try expect(!shutdownFinished, "Monitor shutdown did not drain a prepared image save")
+
+        try saver.finish()
+        await shutdown.value
+        do {
+            _ = try await preparation.value
+            throw ViewModelTestFailure.assertion("Prepared image registered after monitor shutdown")
+        } catch is CancellationError {
+            // Expected: shutdown owns and discards the late save result.
+        }
+
+        try expect(discarder.count == 1, "Late prepared image was not discarded exactly once")
+        try expect(!FileManager.default.fileExists(atPath: destination.path), "Late prepared image became an orphan")
+    }
+
+    @MainActor
+    private static func testPreparedClipboardImageRevalidatesCanonical(in root: URL) async throws {
+        let base = root.appendingPathComponent("prepared-image-canonical", isDirectory: true)
+        let suite = "QuickStashTests.clipboard.prepared-canonical.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create prepared canonical defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let fileManager = QuickStashFileManager(baseDirectory: base.appendingPathComponent("files"))
+        let storageManager = StorageManager(baseDirectory: base.appendingPathComponent("metadata"))
+        let pixels = try makeBitmapImageData(width: 46, height: 35, fileType: .png)
+        let canonical = try await fileManager.saveClipboardImage(data: pixels, fileExtension: "png")
+        var pinnedCanonical = canonical
+        pinnedCanonical.isPinned = true
+        let viewModel = StashViewModel(
+            storageManager: storageManager,
+            fileManager: fileManager,
+            loadOnInit: false,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {}
+        )
+        viewModel.addItem(pinnedCanonical)
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(
+            to: URL(fileURLWithPath: canonical.content),
+            options: .atomic
+        )
+
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: FakeClipboardPasteboard(),
+            imageSaver: { data, fileExtension, observedAt in
+                try await fileManager.saveClipboardImage(
+                    data: data,
+                    fileExtension: fileExtension,
+                    createdAt: observedAt
+                )
+            },
+            imageDiscarder: { item in
+                await fileManager.discardUnregisteredClipboardImage(at: item.content)
+            }
+        )
+        monitor.onPromoteDuplicateImage = { fingerprint, observedAt, isStillValid in
+            await viewModel.promoteDuplicateClipboardImage(
+                fingerprint: fingerprint,
+                observedAt: observedAt,
+                isStillValid: isStillValid
+            )
+        }
+        monitor.onNewItem = { viewModel.addItem($0) }
+
+        let prepared = try await monitor.prepareImageRecord(
+            data: pixels,
+            observedAt: Date(timeIntervalSince1970: 70_000)
+        )
+        let didCommit = await monitor.commitPreparedImageRecord(prepared)
+        try expect(didCommit, "Prepared screenshot did not commit after canonical validation")
+        try await waitUntil(description: "prepared screenshot stale canonical cleanup") {
+            !FileManager.default.fileExists(atPath: canonical.content)
+        }
+        guard let repaired = viewModel.items.first(where: { $0.id == canonical.id }) else {
+            throw ViewModelTestFailure.assertion("Prepared screenshot lost the canonical history ID")
+        }
+        try expect(viewModel.items.count == 1, "Prepared screenshot created duplicate history metadata")
+        try expect(repaired.content == prepared.content, "Prepared screenshot kept a corrupt canonical backing")
+        try expect(repaired.isPinned, "Prepared screenshot replacement lost the canonical pin")
+        try expect(FileManager.default.fileExists(atPath: prepared.content), "Prepared screenshot backing was discarded")
+
+        await monitor.shutdownAndDrain()
+        await viewModel.flushForTermination()
+    }
+
+    @MainActor
+    private static func testDuplicateImagePromotionChecksValidityAfterFileIO(
+        in root: URL
+    ) async throws {
+        let base = root.appendingPathComponent("duplicate-image-validity", isDirectory: true)
+        let blocker = BlockingQuarantineScript()
+        let fileManager = QuickStashFileManager(
+            baseDirectory: base.appendingPathComponent("files", isDirectory: true),
+            cleanupFaultInjector: { blocker.inject($0) }
+        )
+        let canonicalData = try makeBitmapImageData(width: 47, height: 37, fileType: .png)
+        let blockerData = try makeBitmapImageData(width: 48, height: 37, fileType: .png)
+        let canonical = try await fileManager.saveClipboardImage(
+            data: canonicalData,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 80_000)
+        )
+        let blockingItem = try await fileManager.saveClipboardImage(
+            data: blockerData,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 80_001)
+        )
+        let viewModel = StashViewModel(
+            storageManager: StorageManager(baseDirectory: base.appendingPathComponent("metadata")),
+            fileManager: fileManager,
+            loadOnInit: false,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {}
+        )
+        viewModel.addItem(canonical)
+
+        var released = false
+        defer {
+            if !released { blocker.release.signal() }
+        }
+        let quarantine = Task {
+            try? await fileManager.quarantineManagedFile(at: blockingItem.content)
+        }
+        try await waitUntil(description: "file queue blocked before duplicate validation") {
+            blocker.started
+        }
+
+        let validity = AsyncValidityGate()
+        let promotion = Task {
+            await viewModel.promoteDuplicateClipboardImage(
+                fingerprint: canonical.contentFingerprint ?? "",
+                observedAt: Date(timeIntervalSince1970: 80_100),
+                isStillValid: { validity.check() }
+            )
+        }
+        try await waitUntil(description: "duplicate promotion entered file validation") {
+            validity.checkCount == 1
+        }
+        validity.isValid = false
+        blocker.release.signal()
+        released = true
+        _ = await quarantine.value
+
+        let promoted = await promotion.value
+        try expect(!promoted, "Invalid duplicate-image operation promoted after file validation")
+        try expect(viewModel.items.count == 1, "Invalid duplicate-image operation changed item count")
+        try expect(
+            viewModel.items[0].createdAt == canonical.createdAt,
+            "Invalid duplicate-image operation changed ordering metadata"
+        )
+        await viewModel.flushForTermination()
     }
 
     @MainActor
@@ -2353,6 +3268,93 @@ struct QuickStashViewModelTests {
     }
 
     @MainActor
+    private static func testClipboardGracefulTerminationDrainsLastSlowRead() async throws {
+        let suite = "QuickStashTests.clipboard.graceful-slow-read.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create graceful slow-read defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let pasteboard = FakeClipboardPasteboard()
+        pasteboard.changeCount = 6_000
+        let readGate = DispatchSemaphore(value: 0)
+        pasteboard.readGate = readGate
+        var received: [StashItem] = []
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: pasteboard,
+            imageSaver: { _, _, _ in throw CocoaError(.fileWriteUnknown) }
+        )
+        monitor.onNewItem = { received.append($0) }
+        monitor.setConsent(.enabled)
+
+        pasteboard.text = "退出动作发现的最后一条慢文字"
+        pasteboard.changeCount = 6_001
+        var shutdownFinished = false
+        let shutdown = Task {
+            await monitor.shutdownForTermination(
+                settleNanoseconds: 0,
+                payloadReadDrainTimeout: 1
+            )
+            shutdownFinished = true
+        }
+        try await waitUntil(description: "termination-triggered slow clipboard read") {
+            pasteboard.payloadReadCount == 1
+        }
+        try expect(!shutdownFinished, "Graceful termination abandoned a live clipboard read")
+
+        readGate.signal()
+        await shutdown.value
+        try expect(shutdownFinished, "Graceful termination did not finish after the provider returned")
+        try expect(received.count == 1, "Graceful termination lost or duplicated its final slow read")
+        try expect(
+            received[0].content == "退出动作发现的最后一条慢文字",
+            "Graceful termination changed its final slow clipboard content"
+        )
+    }
+
+    @MainActor
+    private static func testClipboardGracefulTerminationTimesOutBlockedRead() async throws {
+        let suite = "QuickStashTests.clipboard.graceful-read-timeout.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            throw ViewModelTestFailure.assertion("Could not create graceful read-timeout defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let pasteboard = FakeClipboardPasteboard()
+        pasteboard.changeCount = 6_100
+        let readGate = DispatchSemaphore(value: 0)
+        pasteboard.readGate = readGate
+        var received: [StashItem] = []
+        let monitor = ClipboardMonitor(
+            preferences: ClipboardPreferences(defaults: defaults),
+            pasteboard: pasteboard,
+            imageSaver: { _, _, _ in throw CocoaError(.fileWriteUnknown) }
+        )
+        monitor.onNewItem = { received.append($0) }
+        monitor.setConsent(.enabled)
+        pasteboard.text = "不应在退出超时后晚到的文字"
+        pasteboard.changeCount = 6_101
+
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        await monitor.shutdownForTermination(
+            settleNanoseconds: 0,
+            payloadReadDrainTimeout: 0.05
+        )
+        let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+        try expect(elapsed < 0.5, "Graceful termination waited indefinitely for a blocked provider")
+        try expect(pasteboard.payloadReadCount == 1, "Termination did not attempt its final clipboard read")
+        try expect(received.isEmpty, "Blocked provider published before it returned")
+
+        readGate.signal()
+        try await waitUntil(description: "timed-out provider completion") {
+            pasteboard.payloadReadCompletionCount == 1
+        }
+        await Task.yield()
+        try expect(received.isEmpty, "Timed-out provider published after graceful shutdown")
+    }
+
+    @MainActor
     private static func testClipboardGracefulTerminationDrainsImageSave(
         in root: URL
     ) async throws {
@@ -2660,14 +3662,137 @@ struct QuickStashViewModelTests {
     }
 
     @MainActor
+    private static func testTerminationWaitsForManualClipboardClear(in root: URL) async throws {
+        let base = root.appendingPathComponent("termination-manual-clear", isDirectory: true)
+        let blocker = BlockingQuarantineScript()
+        let fileManager = QuickStashFileManager(
+            baseDirectory: base.appendingPathComponent("files", isDirectory: true),
+            cleanupFaultInjector: { blocker.inject($0) }
+        )
+        let storageManager = StorageManager(
+            baseDirectory: base.appendingPathComponent("metadata", isDirectory: true)
+        )
+        let image = try await fileManager.saveClipboardImage(
+            data: try makeBitmapImageData(width: 58, height: 43, fileType: .png),
+            fileExtension: "png"
+        )
+        let viewModel = StashViewModel(
+            storageManager: storageManager,
+            fileManager: fileManager,
+            loadOnInit: false,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {}
+        )
+        viewModel.addItem(image)
+
+        var released = false
+        defer {
+            if !released { blocker.release.signal() }
+        }
+        let clear = Task { await viewModel.clearUnpinnedClipboardItems() }
+        try await waitUntil(description: "manual clear quarantine blocked") { blocker.started }
+
+        var flushFinished = false
+        let flush = Task {
+            await viewModel.flushForTermination()
+            flushFinished = true
+        }
+        try await waitUntil(description: "termination flush entered") {
+            viewModel.isTerminationFlushActive
+        }
+        try expect(!flushFinished, "Termination flush did not wait for manual clipboard clear")
+
+        blocker.release.signal()
+        released = true
+        let clearResult = await clear.value
+        await flush.value
+        try expect(clearResult.removedCount == 1, "Tracked manual clear did not remove its image")
+        try expect(!FileManager.default.fileExists(atPath: image.content), "Tracked manual clear left its backing")
+
+        let loadResult = await withCheckedContinuation { continuation in
+            storageManager.loadSnapshot { continuation.resume(returning: $0) }
+        }
+        guard case .loaded(let snapshot) = loadResult else {
+            throw ViewModelTestFailure.assertion("Termination did not persist manual clear metadata")
+        }
+        try expect(
+            !snapshot.items.contains(where: { $0.id == image.id }),
+            "Termination snapshot retained a manually cleared image"
+        )
+    }
+
+    @MainActor
+    private static func testManualDeletePreservesConcurrentDuplicateImage(in root: URL) async throws {
+        let base = root.appendingPathComponent("manual-delete-image-race", isDirectory: true)
+        let blocker = BlockingQuarantineScript()
+        let fileManager = QuickStashFileManager(
+            baseDirectory: base.appendingPathComponent("files", isDirectory: true),
+            cleanupFaultInjector: { blocker.inject($0) }
+        )
+        let pixels = try makeBitmapImageData(width: 52, height: 39, fileType: .png)
+        let original = try await fileManager.saveClipboardImage(
+            data: pixels,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 10_000)
+        )
+        let replacement = try await fileManager.saveClipboardImage(
+            data: pixels,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 10_001)
+        )
+        let viewModel = StashViewModel(
+            storageManager: StorageManager(baseDirectory: base.appendingPathComponent("metadata")),
+            fileManager: fileManager,
+            loadOnInit: false,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {}
+        )
+        viewModel.addItem(original)
+
+        var released = false
+        defer {
+            if !released { blocker.release.signal() }
+        }
+        viewModel.deleteItem(original)
+        try await waitUntil(description: "manual image deletion quarantine") { blocker.started }
+
+        viewModel.addItem(replacement)
+        let replacementWasInsertedWhileBlocked = viewModel.items.contains(where: {
+            $0.id == replacement.id && $0.content == replacement.content
+        })
+        viewModel.togglePin(original)
+        let originalStayedUnpinned = viewModel.items.first(where: { $0.id == original.id })?.isPinned == false
+
+        blocker.release.signal()
+        released = true
+        await viewModel.flushForTermination()
+
+        try expect(replacementWasInsertedWhileBlocked, "Duplicate image was merged into a record being deleted")
+        try expect(originalStayedUnpinned, "Record changed pin state while manual deletion was in flight")
+        try expect(!viewModel.items.contains(where: { $0.id == original.id }), "Deleted image metadata remained")
+        try expect(
+            viewModel.items.contains(where: {
+                $0.id == replacement.id && $0.content == replacement.content
+            }),
+            "Late manual deletion removed the newly captured duplicate image"
+        )
+        try expect(viewModel.items.count == 1, "Manual deletion race left unexpected image records")
+        try expect(!FileManager.default.fileExists(atPath: original.content), "Deleted image backing was not quarantined")
+        try expect(FileManager.default.fileExists(atPath: replacement.content), "Replacement image backing was discarded")
+    }
+
+    @MainActor
     private static func testClipboardImageOrphanRecoveryRetentionClearAndRestart(in root: URL) async throws {
         let base = root.appendingPathComponent("clipboard-orphan-recovery", isDirectory: true)
         let filesBase = base.appendingPathComponent("files", isDirectory: true)
         let metadataBase = base.appendingPathComponent("metadata", isDirectory: true)
         let fileManager = QuickStashFileManager(baseDirectory: filesBase)
-        let pngFixture = try makeBitmapImageData(fileType: .png)
-        let oldOrphan = try await fileManager.saveClipboardImage(data: pngFixture, fileExtension: "png")
-        let freshOrphan = try await fileManager.saveClipboardImage(data: pngFixture, fileExtension: "png")
+        let oldPixels = try makeBitmapImageData(width: 64, height: 48, fileType: .png)
+        let freshPixels = try makeBitmapImageData(width: 65, height: 48, fileType: .png)
+        let oldOrphan = try await fileManager.saveClipboardImage(data: oldPixels, fileExtension: "png")
+        let freshOrphan = try await fileManager.saveClipboardImage(data: freshPixels, fileExtension: "png")
         let oldFileName = URL(fileURLWithPath: oldOrphan.content).lastPathComponent
         let freshFileName = URL(fileURLWithPath: freshOrphan.content).lastPathComponent
         let now = Date(timeIntervalSince1970: 2_200_000_000)
@@ -2748,8 +3873,9 @@ struct QuickStashViewModelTests {
             cleanupFaultInjector: { try injector.inject($0) }
         )
         let pngFixture = try makeBitmapImageData(fileType: .png)
+        let secondPNGFixture = try makeBitmapImageData(width: 65, height: 48, fileType: .png)
         let firstImage = try await fileManager.saveClipboardImage(data: pngFixture, fileExtension: "png")
-        let secondImage = try await fileManager.saveClipboardImage(data: pngFixture, fileExtension: "png")
+        let secondImage = try await fileManager.saveClipboardImage(data: secondPNGFixture, fileExtension: "png")
         injector.select(URL(fileURLWithPath: secondImage.content))
         let text = StashItem(
             type: .text,
@@ -2985,6 +4111,308 @@ struct QuickStashViewModelTests {
         }
         try expect(snapshot.items.count == 2, "Bootstrap flush wrote an empty or stale snapshot")
         try expect(snapshot.revision > 9, "Bootstrap did not advance the stored revision")
+    }
+
+    @MainActor
+    private static func testBootstrapDuplicateAliasReplaysDelete(in root: URL) async throws {
+        let base = root.appendingPathComponent("bootstrap-duplicate-alias-delete", isDirectory: true)
+        let metadataBase = base.appendingPathComponent("metadata", isDirectory: true)
+        let canonical = StashItem(
+            type: .text,
+            content: "bootstrap duplicate delete",
+            preview: "canonical",
+            createdAt: Date(timeIntervalSince1970: 70_000),
+            managedOrigin: .clipboard
+        )
+        let marker = StashItem(
+            type: .text,
+            content: "bootstrap delete marker",
+            preview: "marker"
+        )
+        try StorageManager(baseDirectory: metadataBase).flushSynchronously(StorageSnapshot(
+            revision: 21,
+            items: [canonical, marker],
+            importJobs: []
+        ))
+
+        let blockingStore = BlockingReadStorageFileStore()
+        let loadingStorage = StorageManager(baseDirectory: metadataBase, fileStore: blockingStore)
+        let viewModel = StashViewModel(
+            storageManager: loadingStorage,
+            fileManager: QuickStashFileManager(baseDirectory: base.appendingPathComponent("files")),
+            loadOnInit: true,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {}
+        )
+        try await waitUntil(description: "duplicate delete bootstrap read") {
+            blockingStore.hasStartedReading
+        }
+
+        let incoming = StashItem(
+            type: .text,
+            content: canonical.content,
+            preview: "incoming",
+            createdAt: canonical.createdAt.addingTimeInterval(1),
+            managedOrigin: .clipboard
+        )
+        viewModel.addItem(incoming)
+        viewModel.deleteItem(incoming)
+        blockingStore.allowRead.signal()
+
+        try await waitUntil(description: "duplicate alias delete replay") {
+            viewModel.items.contains(where: { $0.id == marker.id })
+                && !viewModel.items.contains(where: { $0.id == canonical.id })
+                && !viewModel.items.contains(where: { $0.id == incoming.id })
+        }
+        await viewModel.flushForTermination()
+
+        guard case .loaded(let persisted) = StorageManager(baseDirectory: metadataBase)
+            .loadSnapshotSynchronously() else {
+            throw ViewModelTestFailure.assertion("Duplicate alias delete snapshot did not persist")
+        }
+        try expect(
+            persisted.items.map(\.id) == [marker.id],
+            "Delete replay did not target the persisted canonical ID"
+        )
+    }
+
+    @MainActor
+    private static func testBootstrapDuplicateAliasResolvesTogglePin(in root: URL) async throws {
+        let base = root.appendingPathComponent("bootstrap-duplicate-alias-pin", isDirectory: true)
+        let metadataBase = base.appendingPathComponent("metadata", isDirectory: true)
+        let canonical = StashItem(
+            type: .url,
+            content: "https://bootstrap-alias.example/pin",
+            preview: "canonical",
+            createdAt: Date(timeIntervalSince1970: 71_000),
+            managedOrigin: .clipboard
+        )
+        try StorageManager(baseDirectory: metadataBase).flushSynchronously(StorageSnapshot(
+            revision: 22,
+            items: [canonical],
+            importJobs: []
+        ))
+
+        let blockingStore = BlockingReadStorageFileStore()
+        let viewModel = StashViewModel(
+            storageManager: StorageManager(baseDirectory: metadataBase, fileStore: blockingStore),
+            fileManager: QuickStashFileManager(baseDirectory: base.appendingPathComponent("files")),
+            loadOnInit: true,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {}
+        )
+        try await waitUntil(description: "duplicate pin bootstrap read") {
+            blockingStore.hasStartedReading
+        }
+
+        let incoming = StashItem(
+            type: .url,
+            content: canonical.content,
+            preview: "incoming",
+            createdAt: canonical.createdAt.addingTimeInterval(1),
+            managedOrigin: .clipboard
+        )
+        viewModel.addItem(incoming)
+        viewModel.togglePin(incoming)
+        blockingStore.allowRead.signal()
+
+        try await waitUntil(description: "duplicate alias pin replay") {
+            viewModel.items.count == 1
+                && viewModel.items[0].id == canonical.id
+                && viewModel.items[0].isPinned
+        }
+        viewModel.togglePin(incoming)
+        try expect(
+            viewModel.items.count == 1
+                && viewModel.items[0].id == canonical.id
+                && !viewModel.items[0].isPinned,
+            "A stale incoming ID did not resolve to the canonical record for togglePin"
+        )
+        await viewModel.flushForTermination()
+    }
+
+    @MainActor
+    private static func testBootstrapDuplicateAliasCompletesAsyncImageCopy(
+        in root: URL
+    ) async throws {
+        let base = root.appendingPathComponent("bootstrap-duplicate-alias-image-copy", isDirectory: true)
+        let filesBase = base.appendingPathComponent("files", isDirectory: true)
+        let metadataBase = base.appendingPathComponent("metadata", isDirectory: true)
+        let fileManager = QuickStashFileManager(baseDirectory: filesBase)
+        let pixels = try makeBitmapImageData(width: 58, height: 42, fileType: .png)
+        let canonical = try await fileManager.saveClipboardImage(
+            data: pixels,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 72_000)
+        )
+        let incoming = try await fileManager.saveClipboardImage(
+            data: pixels,
+            fileExtension: "png",
+            createdAt: canonical.createdAt.addingTimeInterval(1)
+        )
+        try expect(
+            incoming.content != canonical.content
+                && incoming.contentFingerprint == canonical.contentFingerprint,
+            "Async image alias fixture did not use distinct equivalent backings"
+        )
+        try StorageManager(baseDirectory: metadataBase).flushSynchronously(StorageSnapshot(
+            revision: 23,
+            items: [canonical],
+            importJobs: []
+        ))
+        let imageReader = BlockingClipboardImageReader(
+            payload: try await fileManager.readManagedImage(at: incoming.content)
+        )
+        let blockingStore = BlockingReadStorageFileStore()
+        var imageWriteCount = 0
+        let viewModel = StashViewModel(
+            storageManager: StorageManager(baseDirectory: metadataBase, fileStore: blockingStore),
+            fileManager: fileManager,
+            loadOnInit: true,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {},
+            clipboardImageReader: { path in try await imageReader.read(path) },
+            clipboardImageWriter: { _ in
+                imageWriteCount += 1
+                return true
+            }
+        )
+        try await waitUntil(description: "duplicate image-copy bootstrap read") {
+            blockingStore.hasStartedReading
+        }
+
+        viewModel.addItem(incoming)
+        viewModel.copyToClipboard(incoming)
+        await imageReader.waitUntilStarted()
+        blockingStore.allowRead.signal()
+        try await waitUntil(description: "duplicate image canonical alias") {
+            viewModel.items.count == 1 && viewModel.items[0].id == canonical.id
+        }
+
+        await imageReader.finish()
+        try await waitUntil(description: "aliased async image clipboard write") {
+            imageWriteCount == 1
+        }
+        try expect(
+            viewModel.items.count == 1 && viewModel.items[0].id == canonical.id,
+            "Late async image copy recreated the incoming bootstrap ID"
+        )
+        try expect(
+            viewModel.items[0].createdAt > incoming.createdAt,
+            "Late async image copy did not promote the canonical record"
+        )
+        await viewModel.flushForTermination()
+    }
+
+    @MainActor
+    private static func testBootstrapReplacesCorruptClipboardCanonicalAfterMetadataFlush(
+        in root: URL
+    ) async throws {
+        let base = root.appendingPathComponent("bootstrap-corrupt-image-replacement", isDirectory: true)
+        let filesBase = base.appendingPathComponent("files", isDirectory: true)
+        let metadataBase = base.appendingPathComponent("metadata", isDirectory: true)
+        let quarantine = BlockingQuarantineScript()
+        let fileManager = QuickStashFileManager(
+            baseDirectory: filesBase,
+            cleanupFaultInjector: { quarantine.inject($0) }
+        )
+        let pixels = try makeBitmapImageData(width: 57, height: 43, fileType: .png)
+        var canonical = try await fileManager.saveClipboardImage(
+            data: pixels,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 60_000)
+        )
+        canonical.isPinned = true
+        let seedStorage = StorageManager(baseDirectory: metadataBase)
+        try seedStorage.flushSynchronously(StorageSnapshot(
+            revision: 12,
+            items: [canonical],
+            importJobs: []
+        ))
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(
+            to: URL(fileURLWithPath: canonical.content),
+            options: .atomic
+        )
+
+        let blockingStore = BlockingReadStorageFileStore()
+        let loadingStorage = StorageManager(baseDirectory: metadataBase, fileStore: blockingStore)
+        let viewModel = StashViewModel(
+            storageManager: loadingStorage,
+            fileManager: fileManager,
+            loadOnInit: true,
+            purgeOnInit: false,
+            retentionPolicy: ClipboardRetentionPolicy(maximumItemCount: nil, maximumAgeDays: nil),
+            clipboardCaptureInvalidator: {}
+        )
+        try await waitUntil(description: "corrupt canonical bootstrap read") {
+            blockingStore.hasStartedReading
+        }
+
+        let replacement = try await fileManager.saveClipboardImage(
+            data: pixels,
+            fileExtension: "png",
+            createdAt: Date(timeIntervalSince1970: 60_001)
+        )
+        try expect(
+            replacement.contentFingerprint == canonical.contentFingerprint,
+            "Bootstrap replacement fixture did not preserve the pixel fingerprint"
+        )
+        viewModel.addItem(replacement)
+
+        var quarantineReleased = false
+        defer {
+            if !quarantineReleased { quarantine.release.signal() }
+        }
+        blockingStore.allowRead.signal()
+        try await waitUntil(description: "corrupt canonical replacement quarantine") {
+            quarantine.started
+        }
+
+        guard let retained = viewModel.items.first, viewModel.items.count == 1 else {
+            throw ViewModelTestFailure.assertion("Bootstrap replacement left duplicate image metadata")
+        }
+        try expect(retained.id == canonical.id, "Bootstrap replacement lost the canonical history ID")
+        try expect(retained.content == replacement.content, "Bootstrap replacement kept the corrupt backing")
+        try expect(retained.isPinned, "Bootstrap replacement lost the canonical pin")
+        try expect(retained.availability == .available, "Bootstrap replacement remained unavailable")
+        try expect(
+            FileManager.default.fileExists(atPath: canonical.content),
+            "Corrupt backing moved before replacement metadata was inspected"
+        )
+
+        let verificationStorage = StorageManager(baseDirectory: metadataBase)
+        guard case .loaded(let persistedBeforeQuarantine) = verificationStorage.loadSnapshotSynchronously() else {
+            throw ViewModelTestFailure.assertion("Replacement metadata was not flushed before quarantine")
+        }
+        try expect(
+            persistedBeforeQuarantine.items.count == 1
+                && persistedBeforeQuarantine.items[0].id == canonical.id
+                && persistedBeforeQuarantine.items[0].content == replacement.content,
+            "Quarantine started before replacement metadata reached disk"
+        )
+        try expect(
+            !persistedBeforeQuarantine.items.contains(where: { $0.content == canonical.content }),
+            "Persisted metadata still referenced the backing awaiting quarantine"
+        )
+
+        quarantine.release.signal()
+        quarantineReleased = true
+        await viewModel.flushForTermination()
+
+        try expect(!FileManager.default.fileExists(atPath: canonical.content), "Corrupt canonical backing was not quarantined")
+        try expect(FileManager.default.fileExists(atPath: replacement.content), "Replacement backing was removed during cleanup")
+        let trashDirectory = filesBase.appendingPathComponent("QuickStash/Trash", isDirectory: true)
+        let trashContents = try FileManager.default.contentsOfDirectory(
+            at: trashDirectory,
+            includingPropertiesForKeys: nil
+        )
+        try expect(
+            trashContents.contains(where: { $0.lastPathComponent.hasSuffix("-\(URL(fileURLWithPath: canonical.content).lastPathComponent)") }),
+            "Corrupt canonical backing did not enter the quarantine directory"
+        )
     }
 
     @MainActor

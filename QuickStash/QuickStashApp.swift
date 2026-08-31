@@ -41,7 +41,7 @@ class QuickStashApp: NSObject, NSApplicationDelegate {
     var localMouseTracker: Any?
     var draggableButton: DraggableStatusButton?
     var floatingWindowCloseObserver: NSObjectProtocol?
-    var terminationTask: Task<Void, Never>?
+    var terminationCoordinator: TerminationDeadlineCoordinator?
     // Hosted tests return before touching app state; lazy initialization keeps their I/O isolated.
     lazy var viewModel = StashViewModel.shared
 
@@ -140,6 +140,14 @@ class QuickStashApp: NSObject, NSApplicationDelegate {
 
         ClipboardMonitor.shared.onNewItem = { [weak self] item in
             self?.viewModel.addItem(item)
+        }
+        ClipboardMonitor.shared.onPromoteDuplicateImage = { [weak self] fingerprint, observedAt, isStillValid in
+            guard let self else { return false }
+            return await self.viewModel.promoteDuplicateClipboardImage(
+                fingerprint: fingerprint,
+                observedAt: observedAt,
+                isStillValid: isStillValid
+            )
         }
         ClipboardMonitor.shared.onError = { [weak self] message in
             self?.viewModel.lastError = message
@@ -649,7 +657,7 @@ class QuickStashApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard terminationTask == nil else { return .terminateLater }
+        guard terminationCoordinator == nil else { return .terminateLater }
         ScreenshotCoordinator.shared.shutdown()
         hideOverlayTimer?.invalidate()
         hideOverlayTimer = nil
@@ -672,16 +680,20 @@ class QuickStashApp: NSObject, NSApplicationDelegate {
         }
         pointerEventRelay = nil
 
-        terminationTask = Task { [weak self] in
-            guard let self else {
+        let coordinator = TerminationDeadlineCoordinator()
+        terminationCoordinator = coordinator
+        coordinator.start(
+            drain: { [weak self] in
+                await ScreenshotCoordinator.shared.drainAfterShutdown()
+                guard !Task.isCancelled else { return }
+                await ClipboardMonitor.shared.shutdownForTermination()
+                guard !Task.isCancelled, let self else { return }
+                await self.viewModel.flushForTermination()
+            },
+            reply: { _ in
                 sender.reply(toApplicationShouldTerminate: true)
-                return
             }
-            await ScreenshotCoordinator.shared.drainAfterShutdown()
-            await ClipboardMonitor.shared.shutdownForTermination()
-            await self.viewModel.flushForTermination()
-            sender.reply(toApplicationShouldTerminate: true)
-        }
+        )
         return .terminateLater
     }
 

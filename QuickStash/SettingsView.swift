@@ -147,6 +147,18 @@ struct SettingsView: View {
                     .padding(12)
                     .background(Color(nsColor: .quaternaryLabelColor).opacity(0.2))
                     .cornerRadius(8)
+
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Design by GDZ")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.primary)
+                        Spacer()
+                        Text(Self.versionDescription)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 4)
+                    .accessibilityElement(children: .combine)
                 }
                 .padding(16)
             }
@@ -167,6 +179,13 @@ struct SettingsView: View {
         case .enabled: return "已启用；每 0.25 秒检查变化，敏感类型会跳过"
         case .disabled: return "已关闭；不会读取新的剪贴板内容"
         }
+    }
+
+    private static var versionDescription: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "-"
+        let build = info?["CFBundleVersion"] as? String ?? "-"
+        return "Version \(version) (\(build))"
     }
 
     private func settingRow<Accessory: View>(

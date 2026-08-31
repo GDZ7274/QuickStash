@@ -117,6 +117,7 @@ xcrun swiftc \
   -strict-concurrency=complete \
   -warn-concurrency \
   -warnings-as-errors \
+  "$source_root/TerminationDeadlineCoordinator.swift" \
   "$source_root/Models.swift" \
   "$source_root/FileManager+QuickStash.swift" \
   "$source_root/StorageManager.swift" \

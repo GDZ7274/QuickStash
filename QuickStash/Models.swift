@@ -238,6 +238,7 @@ struct StashItem: Identifiable, Codable, Sendable, Equatable {
     let content: String
     let preview: String
     let createdAt: Date
+    let contentFingerprint: String?
     var isPinned: Bool
     var availability: ItemAvailability
     var managedOrigin: ManagedItemOrigin
@@ -250,20 +251,23 @@ struct StashItem: Identifiable, Codable, Sendable, Equatable {
         createdAt: Date = Date(),
         isPinned: Bool = false,
         availability: ItemAvailability = .available,
-        managedOrigin: ManagedItemOrigin = .imported
+        managedOrigin: ManagedItemOrigin = .imported,
+        contentFingerprint: String? = nil
     ) {
         self.id = id
         self.type = type
         self.content = content
         self.preview = preview
         self.createdAt = createdAt
+        self.contentFingerprint = contentFingerprint
         self.isPinned = isPinned
         self.availability = availability
         self.managedOrigin = managedOrigin
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, type, content, preview, createdAt, isPinned, availability, managedOrigin
+        case id, type, content, preview, createdAt, contentFingerprint
+        case isPinned, availability, managedOrigin
     }
 
     init(from decoder: Decoder) throws {
@@ -273,6 +277,7 @@ struct StashItem: Identifiable, Codable, Sendable, Equatable {
         content = try container.decode(String.self, forKey: .content)
         preview = try container.decode(String.self, forKey: .preview)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
+        contentFingerprint = try container.decodeIfPresent(String.self, forKey: .contentFingerprint)
         isPinned = try container.decode(Bool.self, forKey: .isPinned)
         availability = try container.decodeIfPresent(ItemAvailability.self, forKey: .availability) ?? .available
         managedOrigin = try container.decodeIfPresent(ManagedItemOrigin.self, forKey: .managedOrigin) ?? .legacyUnknown
